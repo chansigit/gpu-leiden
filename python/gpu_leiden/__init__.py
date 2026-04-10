@@ -34,6 +34,7 @@ def leiden_from_csr(
     flavor: str = "deterministic",
     n_restarts: int = 4,
     temperature: float = 0.5,
+    verbose: bool = False,
 ) -> np.ndarray:
     """Run GPU Leiden community detection on a sparse graph.
 
@@ -87,6 +88,11 @@ def leiden_from_csr(
         (closer to deterministic), higher values are more exploratory.
         Default ``0.5`` is empirically a good balance for scanpy-style
         connectivity graphs across a wide range of sizes.
+    verbose
+        If ``True``, re-enable the C/CUDA developer output (per-level
+        Leiden progress, kernel profile timings, ILS restart lines,
+        shake diagnostics). Defaults to ``False`` so that drop-in
+        use as a scanpy backend produces clean stdout.
 
     Returns
     -------
@@ -132,4 +138,5 @@ def leiden_from_csr(
         flavor=int(flavor_int),
         n_restarts=int(n_restarts),
         temperature=float(temperature),
+        verbose=int(bool(verbose)),
     )

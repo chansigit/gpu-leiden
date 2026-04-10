@@ -89,7 +89,8 @@ if (mode == "cpu") {
         labels,
         /*flavor=*/0,
         /*n_restarts=*/0,
-        /*temperature=*/0.0
+        /*temperature=*/0.0,
+        /*verbose=*/1  // CLI mode: keep full output for debugging
     );
     // Print a summary: number of unique labels (= number of final communities)
     std::set<int> unique_labels(labels, labels + g.nodes);

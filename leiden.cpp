@@ -22,7 +22,7 @@ int Leiden_CPU(Leiden_Partition& p, graph& gr)
     double edg_wt = p.weight;
 
     quality = cal_quality(p.sum_in, p.tot_in, p.tot_out, gr.nodes, p.weight, p.resolution);
-    cout << "old quality: " << quality << endl;
+    if (gpu_leiden_verbose) cout << "old quality: " << quality << endl;
     q_prev_it = quality;
 
     time_t start, end;
@@ -114,24 +114,25 @@ int Leiden_CPU(Leiden_Partition& p, graph& gr)
 
         quality = cal_quality(p.sum_in, p.tot_in, p.tot_out, gr.nodes, p.weight, p.resolution);
         imp = quality - prev_quality;
-        cout << "new quality: " << quality << "  imp  = " << imp << endl;
+        if (gpu_leiden_verbose) cout << "new quality: " << quality << "  imp  = " << imp << endl;
 
     } while (mvs > 0 && imp > 0.005);
- time(&end); 
+ time(&end);
  double time_taken = double(end - start) * 1000;
- cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
- cout << "Leiden step completed in " << fixed  << time_taken << setprecision(6); 
- cout << " sec " << endl; 
- cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-
-cout << endl;
+ if (gpu_leiden_verbose) {
+   cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+   cout << "Leiden step completed in " << fixed  << time_taken << setprecision(6);
+   cout << " sec " << endl;
+   cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+   cout << endl;
+ }
 if(quality>q_prev_it)
 {
   c_renumber_communities(p,gr);
 }
 else
 {
-  cout << "Leiden done and dusted :)" << endl;
+  if (gpu_leiden_verbose) cout << "Leiden done and dusted :)" << endl;
 }
   return 0;
 }
@@ -202,7 +203,7 @@ for (auto it = comms.begin(); it != comms.end(); ++it)
     renumber_c.push_back(it->first);
     community_range++;
 }
- cout << "range is: " << community_range << endl << endl;
+ if (gpu_leiden_verbose) cout << "range is: " << community_range << endl << endl;
 
 
 sort(renumber_c.begin(), renumber_c.end());
@@ -305,10 +306,12 @@ for(int i=0; i < adj.in_neighbours.size(); i++)
 }
 auto end_time = std::chrono::high_resolution_clock::now();
 auto duration = std::chrono::duration_cast<std::chrono::minutes>(end_time - start_time);
-cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-std::cout << "Aggreagte step on Host completed in " << duration.count() << " minutes!" << std::endl; 
-cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-cout << "____________________________________________" << endl;
+if (gpu_leiden_verbose) {
+  cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+  std::cout << "Aggreagte step on Host completed in " << duration.count() << " minutes!" << std::endl;
+  cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+  cout << "____________________________________________" << endl;
+}
 create_c_partition(g,p);
 Leiden_CPU(p, g);
 return 0;

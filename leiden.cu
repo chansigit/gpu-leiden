@@ -30,6 +30,11 @@
 
 using namespace std;
 
+// Global verbosity flag (see declaration in leiden.h). Default 1 so
+// that CLI-mode runs keep the output tests/verify.sh depends on.
+// `leiden_from_csr` overrides from its `verbose` parameter on entry.
+int gpu_leiden_verbose = 1;
+
 # define cuCALL(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
 {
@@ -883,14 +888,16 @@ int renumber_communities(Leiden_Partition& p, graph& g,
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::minutes>(end_time - start_time);
-        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-        cout << "Aggregate step on Device completed in " << duration.count() << " minutes!" << std::endl;
-        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-        cout << "____________________________________________" << endl;
-        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-        cout << "Preprocessing on Host completed in 0 minutes!" << std::endl;
-        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-        cout << "____________________________________________" << endl;
+        if (gpu_leiden_verbose) {
+            cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+            cout << "Aggregate step on Device completed in " << duration.count() << " minutes!" << std::endl;
+            cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+            cout << "____________________________________________" << endl;
+            cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+            cout << "Preprocessing on Host completed in 0 minutes!" << std::endl;
+            cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+            cout << "____________________________________________" << endl;
+        }
         return 0;
     }
 
@@ -1021,10 +1028,12 @@ int renumber_communities(Leiden_Partition& p, graph& g,
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::minutes>(end_time - start_time);
-    cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-    cout << "Aggregate step on Device completed in " << duration.count() << " minutes!" << std::endl;
-    cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-    cout << "____________________________________________" << endl;
+    if (gpu_leiden_verbose) {
+        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+        cout << "Aggregate step on Device completed in " << duration.count() << " minutes!" << std::endl;
+        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+        cout << "____________________________________________" << endl;
+    }
 
     auto start_time2 = std::chrono::high_resolution_clock::now();
 
@@ -1109,10 +1118,12 @@ int renumber_communities(Leiden_Partition& p, graph& g,
 
     auto end_time2 = std::chrono::high_resolution_clock::now();
     auto duration2 = std::chrono::duration_cast<std::chrono::minutes>(end_time2 - start_time2);
-    cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-    cout << "Preprocessing on Host completed in " << duration2.count() << " minutes!" << std::endl;
-    cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-    cout << "____________________________________________" << endl;
+    if (gpu_leiden_verbose) {
+        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+        cout << "Preprocessing on Host completed in " << duration2.count() << " minutes!" << std::endl;
+        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+        cout << "____________________________________________" << endl;
+    }
 
     Leiden_GPU(p, g, g.ed, tracked_labels, n_original,
                flavor, random_seed, temperature, out_modularity);
@@ -1393,7 +1404,7 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
     double q_prev_it = 0;
     quality = find_quality_gpu(d_p, V, p.weight, p.resolution);
     q_prev_it = quality;
-    printf("previous quality: %f\n", q_prev_it);
+    if (gpu_leiden_verbose) printf("previous quality: %f\n", q_prev_it);
 
     // Allocate device counter for move counting
     int* d_move_count;
@@ -1517,13 +1528,15 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
         { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_quality += t; }
 
         imp = quality - prev_quality;
-        printf("new quality: %.6f  imp = %.6f\n", quality, imp);
+        if (gpu_leiden_verbose) printf("new quality: %.6f  imp = %.6f\n", quality, imp);
 
     } while (moves > 0 && imp > 1e-5);
 
-    printf("PROFILE V=%d iters=%d  prepare=%.1f phase1=%.1f phase2=%.1f update=%.1f count=%.1f quality=%.1f total=%.1f ms\n",
-           V, n_iters, ms_prepare, ms_phase1, ms_phase2, ms_update, ms_count, ms_quality,
-           ms_prepare + ms_phase1 + ms_phase2 + ms_update + ms_count + ms_quality);
+    if (gpu_leiden_verbose) {
+        printf("PROFILE V=%d iters=%d  prepare=%.1f phase1=%.1f phase2=%.1f update=%.1f count=%.1f quality=%.1f total=%.1f ms\n",
+               V, n_iters, ms_prepare, ms_phase1, ms_phase2, ms_update, ms_count, ms_quality,
+               ms_prepare + ms_phase1 + ms_phase2 + ms_update + ms_count + ms_quality);
+    }
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_stop);
 
@@ -1571,7 +1584,7 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
         long refine_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                              refine_t1 - refine_t0)
                              .count();
-        printf("REFINE: %ld ms\n", refine_ms);
+        if (gpu_leiden_verbose) printf("REFINE: %ld ms\n", refine_ms);
     }
 
     // Free device memory
@@ -1612,10 +1625,12 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::minutes>(end_time - start_time);
-    cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-    std::cout << "Leiden step completed in " << duration.count() << " minutes!" << std::endl; 
-    cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-    cout << "____________________________________________" << endl;
+    if (gpu_leiden_verbose) {
+        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+        std::cout << "Leiden step completed in " << duration.count() << " minutes!" << std::endl;
+        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+        cout << "____________________________________________" << endl;
+    }
 
     // Termination check: if refinement produced a partition in which
     // every node is in its own community (i.e., number of distinct
@@ -1684,7 +1699,7 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
         if (out_modularity != NULL) {
             *out_modularity = quality;
         }
-        cout << "Leiden_GPU done and dusted :)" << endl;
+        if (gpu_leiden_verbose) cout << "Leiden_GPU done and dusted :)" << endl;
     }
 
     return 0;
@@ -1878,9 +1893,20 @@ int leiden_from_csr(
     // Phase 3.1 probabilistic / quality flavor parameters.
     int flavor,
     int n_restarts,
-    double temperature
+    double temperature,
+    // Phase 3.3: verbose output flag. 0 = silence all the per-level
+    // Leiden progress, kernel profile timings, ILS restart lines and
+    // shake diagnostics. Non-zero restores the developer-facing output.
+    // Python wrapper defaults to 0 so scanpy users get clean output.
+    int verbose
 )
 {
+    // Install the requested verbosity level globally for the duration
+    // of this call. leiden_from_csr runs on a single host thread and
+    // reads gpu_leiden_verbose from many helper functions inside the
+    // shared library, so a global is the least invasive plumbing.
+    gpu_leiden_verbose = verbose;
+
     // Resolve iteration count. Default to 2 passes (matching leidenalg).
     const int n_iters = (max_iterations <= 0) ? 2 : max_iterations;
     // Quality-flavor defaults. n_restarts < 0 means "use default" (4);
@@ -1924,7 +1950,7 @@ int leiden_from_csr(
                 create_c_partition_from_labels(g, p, current_labels);
             }
 
-            {
+            if (gpu_leiden_verbose) {
                 std::vector<int> tmp(p.node_comm, p.node_comm + n_nodes);
                 std::sort(tmp.begin(), tmp.end());
                 tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
@@ -2073,7 +2099,7 @@ int leiden_from_csr(
                 /*k_shake=*/k_shake,
                 /*top_frac=*/0.20,
                 shake_rng,
-                /*verbose=*/true);
+                /*verbose=*/(bool)gpu_leiden_verbose);
         }
 
         for (int iter = 0; iter < n_iters; iter++) {
@@ -2095,7 +2121,7 @@ int leiden_from_csr(
                 create_c_partition_from_labels(g, p, current_labels);
             }
 
-            {
+            if (gpu_leiden_verbose) {
                 std::vector<int> tmp(p.node_comm, p.node_comm + n_nodes);
                 std::sort(tmp.begin(), tmp.end());
                 tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
@@ -2202,17 +2228,19 @@ int leiden_from_csr(
             no_improve++;
         }
 
-        const char* kind_final = (restart == 0) ? "DET  " : "KICK ";
-        if (restart > 0 && shaken_nodes > 0) {
-            printf("ILS %s run %d/%d: modularity = %.6f (best so far: %.6f)%s  "
-                   "[shaken=%d, k=%d]\n",
-                   kind_final, restart, n_runs, run_modularity, best_modularity,
-                   improved ? " [accepted]" : "",
-                   shaken_nodes, 1 + ((no_improve - (improved ? 0 : 1)) / 2));
-        } else {
-            printf("ILS %s run %d/%d: modularity = %.6f (best so far: %.6f)%s\n",
-                   kind_final, restart, n_runs, run_modularity, best_modularity,
-                   improved ? " [accepted]" : "");
+        if (gpu_leiden_verbose) {
+            const char* kind_final = (restart == 0) ? "DET  " : "KICK ";
+            if (restart > 0 && shaken_nodes > 0) {
+                printf("ILS %s run %d/%d: modularity = %.6f (best so far: %.6f)%s  "
+                       "[shaken=%d, k=%d]\n",
+                       kind_final, restart, n_runs, run_modularity, best_modularity,
+                       improved ? " [accepted]" : "",
+                       shaken_nodes, 1 + ((no_improve - (improved ? 0 : 1)) / 2));
+            } else {
+                printf("ILS %s run %d/%d: modularity = %.6f (best so far: %.6f)%s\n",
+                       kind_final, restart, n_runs, run_modularity, best_modularity,
+                       improved ? " [accepted]" : "");
+            }
         }
 
         delete[] current_labels;

@@ -14,4 +14,5 @@ def leiden_from_csr(
     flavor: int = ...,
     n_restarts: int = ...,
     temperature: float = ...,
+    verbose: int = ...,
 ) -> NDArray[int32]: ...

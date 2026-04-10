@@ -5,6 +5,17 @@
 #include <stdio.h>
 #include "struct.h"
 
+// Global verbosity flag. When non-zero (default), the algorithm prints
+// per-level Leiden progress, kernel profile timings, ILS restart
+// diagnostics and shake events to stdout. When zero, all such output
+// is silenced so that `leiden_from_csr` behaves cleanly when called
+// as a Python extension from a scanpy workflow. The CLI binary paths
+// (`cpu`, `gpu`) leave this at the default so that `tests/verify.sh`
+// byte-identity matches `tests/baseline_{cpu,gpu}.txt`. The C API
+// `leiden_from_csr` sets this from its own `verbose` parameter at
+// entry. Defined in leiden.cu.
+extern int gpu_leiden_verbose;
+
 struct gpu_partition {
   double* tot_out;
   double* tot_in;
@@ -90,7 +101,12 @@ int leiden_from_csr(
     // 1/weight internally (the natural unit of Leiden gain). Lower =
     // greedier, closer to deterministic; higher = more random. A
     // negative value means "use default" (0.5).
-    double temperature
+    double temperature,
+    // Verbose output flag. 0 = quiet (default for Python callers);
+    // any non-zero value re-enables the per-level progress, profile
+    // timings, ILS restart lines and shake diagnostics used during
+    // development and captured by `tests/verify.sh` for the CLI paths.
+    int verbose
 );
 
 }  // extern "C"
