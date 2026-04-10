@@ -15,6 +15,9 @@
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/tuple.h>
 #include <thrust/copy.h>
+#include <thrust/sequence.h>
+#include <thrust/gather.h>
+#include <thrust/scatter.h>
 #include <algorithm>
 #include <cuda_runtime.h>
 #include <cuda.h>
@@ -33,134 +36,192 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 }
 
 
-__device__ double find_to_own(Leiden_Partition& d_p, graph& d_g, double dncomm,
-                              int i, int community, int comm, int chk)
-{
-    // Iterate over outgoing edges of node i
-    for (int neighbour = d_g.out_col[i]; neighbour < d_g.out_col[i + 1]; neighbour++) {
-        int target = d_g.child_out[neighbour];
-        if (i != target && d_p.node_comm[target] == comm) {
-            dncomm += d_g.wts_out[neighbour];
-        }
-    }
+// Phase 2.5b: deterministic move + community-stats recompute.
+//
+// The former update_partition kernel (plus its helpers to_community,
+// removal, update_weights, find_to_own) committed node moves and
+// incrementally updated tot_in/tot_out/sum_in via atomicAdd on shared
+// community slots. Floating-point atomicAdd is non-associative across
+// different accumulation orders, so repeated runs produced tiny numerical
+// drift in the community stats and, after enough iterations, diverged
+// to different cluster assignments.
+//
+// Replacement: a two-step sequence, both bit-deterministic.
+//
+//   Step A — apply_moves_assign_kernel:
+//     writes d_p.node_comm[i] = d_p.final_comm[i] (only thread i writes slot i,
+//     no race at all).
+//
+//   Step B — apply_moves_home_kernel (launched after a cudaDeviceSynchronize):
+//     reads the now-finalised node_comm for every edge endpoint and computes
+//     home_comm[i] = sum of weights to neighbours in the new community.
+//
+//   Step C — recompute_community_stats_gpu (host-side helper, below):
+//     rebuilds tot_in[c], tot_out[c], and sum_in[c] from scratch using
+//     thrust::sort_by_key + thrust::reduce_by_key + thrust::scatter.
+//     These Thrust primitives are deterministic: sort_by_key (stable merge /
+//     radix), reduce_by_key (contiguous-run folding), and scatter (distinct
+//     indices, no race).
+//
+// Combined with the warp-shuffle phase-1 reduction, run-to-run output is
+// bit-identical at the cost of an extra O(V log V) sort per outer iteration.
 
-    // Iterate over incoming edges of node i
-    for (int neighbor = d_g.in_col[i]; neighbor < d_g.in_col[i + 1]; neighbor++) {
-        int target = d_g.child_in[neighbor];
-        if (i != target && d_p.node_comm[target] == comm) {
-            dncomm += d_g.wts_in[neighbor];
-        }
-    }
-
-    return dncomm;
-}
-
-
-__device__ double to_community(Leiden_Partition& d_p, graph& d_g, int i, int best_comm, double dncomm)
-{
-    // Iterate over outgoing edges
-    for (int neighbour = d_g.out_col[i]; neighbour < d_g.out_col[i + 1]; neighbour++) {
-        if (d_g.child_out[neighbour] < i) {
-            if (i != d_g.child_out[neighbour] && d_p.node_comm[d_g.child_out[neighbour]] == best_comm) {
-                dncomm += d_g.wts_out[neighbour];
-            }
-        }
-        else if (d_g.child_out[neighbour] > i && d_p.older_comm[d_g.child_out[neighbour]] == best_comm) {
-            dncomm += d_g.wts_out[neighbour];
-        }
-    }
-
-    // Iterate over incoming edges
-    for (int neighbour = d_g.in_col[i]; neighbour < d_g.in_col[i + 1]; neighbour++) {
-        if (d_g.child_in[neighbour] < i) {
-            if (i != d_g.child_in[neighbour] && d_p.node_comm[d_g.child_in[neighbour]] == best_comm) {
-                dncomm += d_g.wts_in[neighbour];
-            }
-        }
-        else if (d_g.child_in[neighbour] > i && d_p.older_comm[d_g.child_in[neighbour]] == best_comm) {
-            dncomm += d_g.wts_in[neighbour];
-        }
-    }
-
-    return dncomm;
-}
-
-
-__device__ double removal(Leiden_Partition& d_p, graph& d_g, double dnc, int i, int comm)
-{
-    // Iterate over outgoing edges
-    for (int neighbour = d_g.out_col[i]; neighbour < d_g.out_col[i + 1]; neighbour++) {
-        if (i != d_g.child_out[neighbour]) {
-            if (d_g.child_out[neighbour] < i && d_p.node_comm[d_g.child_out[neighbour]] == comm) {
-                dnc += d_g.wts_out[neighbour];
-            }
-            else if (d_g.child_out[neighbour] > i && d_p.older_comm[d_g.child_out[neighbour]] == comm) {
-                dnc += d_g.wts_out[neighbour];
-            }
-        }
-    }
-
-    // Iterate over incoming edges
-    for (int neighbour = d_g.in_col[i]; neighbour < d_g.in_col[i + 1]; neighbour++) {
-        if (i != d_g.child_in[neighbour]) {
-            if (d_g.child_in[neighbour] < i && d_p.node_comm[d_g.child_in[neighbour]] == comm) {
-                dnc += d_g.wts_in[neighbour];
-            }
-            else if (d_g.child_in[neighbour] > i && d_p.older_comm[d_g.child_in[neighbour]] == comm) {
-                dnc += d_g.wts_in[neighbour];
-            }
-        }
-    }
-
-    return dnc;
-}
-
-
-__device__ int update_weights(Leiden_Partition& d_p, graph& d_g, int i, double dnc)
-{
-    if (d_p.node_comm[i] != d_p.older_comm[i]) {
-        // Update sum_in for old and new communities using atomic operations
-        atomicAdd(&d_p.sum_in[d_p.older_comm[i]], -(dnc + d_p.self_loops[i]));  // Remove contribution from old community
-        atomicAdd(&d_p.sum_in[d_p.node_comm[i]], d_p.home_comm[i] + d_p.self_loops[i]); // Add contribution to new community
-    }
-
-    // Update total degrees for old and new communities
-    atomicAdd(&d_p.tot_in[d_p.older_comm[i]],  -d_p.in_deg[i]);
-    atomicAdd(&d_p.tot_out[d_p.older_comm[i]], -d_p.out_deg[i]);
-    atomicAdd(&d_p.tot_in[d_p.node_comm[i]],    d_p.in_deg[i]);
-    atomicAdd(&d_p.tot_out[d_p.node_comm[i]],   d_p.out_deg[i]);
-
-    return 0;
-}
-
-
-__global__ void update_partition(Leiden_Partition d_p, graph d_g)
+__global__ void apply_moves_assign_kernel(Leiden_Partition d_p, graph d_g)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d_g.nodes) return;
+    // Pure per-thread write; no cross-thread dependency.
+    d_p.node_comm[i] = d_p.final_comm[i];
+}
 
-    if (i < d_g.nodes)
-    {
-        int best_comm = d_p.final_comm[i];
-        d_p.node_comm[i] = best_comm;
+__global__ void apply_moves_home_kernel(Leiden_Partition d_p, graph d_g)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d_g.nodes) return;
 
-        double dncomm = 0.0;
+    // node_comm is fully committed at this point (separate kernel launched
+    // after cudaDeviceSynchronize), so every read sees the final value.
+    int best_comm = d_p.node_comm[i];
+    double dncomm = 0.0;
 
-        // Compute weight to the new community
-        dncomm = to_community(d_p, d_g, i, best_comm, dncomm);
-
-        if (best_comm != d_p.older_comm[i])
-        {
-            atomicAdd(&d_p.home_comm[i], dncomm);
+    for (int e = d_g.out_col[i]; e < d_g.out_col[i + 1]; e++) {
+        int t = d_g.child_out[e];
+        if (t != i && d_p.node_comm[t] == best_comm) {
+            dncomm += d_g.wts_out[e];
         }
-
-        double dnc = 0.0;
-
-        // Compute weight removal from old community
-        dnc = removal(d_p, d_g, dnc, i, d_p.older_comm[i]);
-
-        // Update community weights
-        update_weights(d_p, d_g, i, dnc);
     }
+    for (int e = d_g.in_col[i]; e < d_g.in_col[i + 1]; e++) {
+        int t = d_g.child_in[e];
+        if (t != i && d_p.node_comm[t] == best_comm) {
+            dncomm += d_g.wts_in[e];
+        }
+    }
+    d_p.home_comm[i] = dncomm;
+}
+
+// Per-node internal-edge weight for sum_in reconstruction:
+//   per_node_internal[v] = self_loops[v]
+//                        + sum_{out edges (v,u), u != v, node_comm[u]==node_comm[v]} wts_out
+//                        + sum_{in  edges (v,u), u != v, node_comm[u]==node_comm[v]} wts_in
+__global__ void compute_per_node_internal_weight_kernel(
+    const int*    node_comm,
+    const int*    out_col,
+    const int*    child_out,
+    const double* wts_out,
+    const int*    in_col,
+    const int*    child_in,
+    const double* wts_in,
+    const double* self_loops,
+    double*       per_node_internal,
+    int           V)
+{
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= V) return;
+    int c = node_comm[v];
+    double s = self_loops[v];
+    for (int e = out_col[v]; e < out_col[v + 1]; e++) {
+        int u = child_out[e];
+        if (u != v && node_comm[u] == c) s += wts_out[e];
+    }
+    for (int e = in_col[v]; e < in_col[v + 1]; e++) {
+        int u = child_in[e];
+        if (u != v && node_comm[u] == c) s += wts_in[e];
+    }
+    per_node_internal[v] = s;
+}
+
+// Host-side helper: deterministically recompute tot_in[c], tot_out[c], and
+// sum_in[c] for all communities c, given the current d_p.node_comm.
+//
+// Working buffers (d_sort_keys, d_sort_idx, d_sorted_vals, d_reduced_keys,
+// d_reduced_vals, d_per_node_internal) are pre-allocated in Leiden_GPU so
+// this is called once per outer iteration without malloc/free churn.
+static void recompute_community_stats_gpu(
+    Leiden_Partition& d_p,
+    graph&            d_g,
+    int               V,
+    int*              d_sort_keys,
+    int*              d_sort_idx,
+    double*           d_sorted_vals,
+    int*              d_reduced_keys,
+    double*           d_reduced_vals,
+    double*           d_per_node_internal)
+{
+    // --- 1. Compute per-node internal edge weight (for sum_in reduction). ---
+    int tpb = 256;
+    int nbl = (V + tpb - 1) / tpb;
+    compute_per_node_internal_weight_kernel<<<nbl, tpb>>>(
+        d_p.node_comm,
+        d_g.out_col, d_g.child_out, d_g.wts_out,
+        d_g.in_col,  d_g.child_in,  d_g.wts_in,
+        d_p.self_loops,
+        d_per_node_internal,
+        V);
+    cudaDeviceSynchronize();
+
+    // --- 2. Sort (community, node_idx) pairs once by community. ---
+    // This sorted ordering drives all three community reductions (tot_in,
+    // tot_out, sum_in) via thrust::gather over d_sort_idx.
+    cudaMemcpy(d_sort_keys, d_p.node_comm, V * sizeof(int),
+               cudaMemcpyDeviceToDevice);
+    thrust::sequence(thrust::device, d_sort_idx, d_sort_idx + V);
+    thrust::sort_by_key(thrust::device,
+                        d_sort_keys, d_sort_keys + V,
+                        d_sort_idx);
+
+    // --- 3. tot_in[c] = sum of in_deg[v] for v in community c. ---
+    thrust::gather(thrust::device,
+                   d_sort_idx, d_sort_idx + V,
+                   d_p.in_deg,
+                   d_sorted_vals);
+    auto end_pair = thrust::reduce_by_key(
+        thrust::device,
+        d_sort_keys, d_sort_keys + V,
+        d_sorted_vals,
+        d_reduced_keys,
+        d_reduced_vals);
+    int K_reduced = (int)(end_pair.first - d_reduced_keys);
+    cudaMemset(d_p.tot_in, 0, V * sizeof(double));
+    thrust::scatter(thrust::device,
+                    d_reduced_vals, d_reduced_vals + K_reduced,
+                    d_reduced_keys,
+                    d_p.tot_in);
+
+    // --- 4. tot_out[c] = sum of out_deg[v] for v in community c. ---
+    thrust::gather(thrust::device,
+                   d_sort_idx, d_sort_idx + V,
+                   d_p.out_deg,
+                   d_sorted_vals);
+    end_pair = thrust::reduce_by_key(
+        thrust::device,
+        d_sort_keys, d_sort_keys + V,
+        d_sorted_vals,
+        d_reduced_keys,
+        d_reduced_vals);
+    K_reduced = (int)(end_pair.first - d_reduced_keys);
+    cudaMemset(d_p.tot_out, 0, V * sizeof(double));
+    thrust::scatter(thrust::device,
+                    d_reduced_vals, d_reduced_vals + K_reduced,
+                    d_reduced_keys,
+                    d_p.tot_out);
+
+    // --- 5. sum_in[c] = sum of per_node_internal[v] for v in community c. ---
+    thrust::gather(thrust::device,
+                   d_sort_idx, d_sort_idx + V,
+                   d_per_node_internal,
+                   d_sorted_vals);
+    end_pair = thrust::reduce_by_key(
+        thrust::device,
+        d_sort_keys, d_sort_keys + V,
+        d_sorted_vals,
+        d_reduced_keys,
+        d_reduced_vals);
+    K_reduced = (int)(end_pair.first - d_reduced_keys);
+    cudaMemset(d_p.sum_in, 0, V * sizeof(double));
+    thrust::scatter(thrust::device,
+                    d_reduced_vals, d_reduced_vals + K_reduced,
+                    d_reduced_keys,
+                    d_p.sum_in);
 }
 
 // Phase 0: refresh older_comm and clear home_comm before each iteration
@@ -384,6 +445,77 @@ __global__ void find_community_phase2(Leiden_Partition d_p, graph d_g)
     if (my_final != my_older) {
         atomicSub(&d_p.size[my_older], 1);
         atomicAdd(&d_p.size[my_final], 1);
+    }
+}
+
+// Phase 2 (deterministic variant, Phase 2.5b).
+//
+// The original find_community_phase2 (above) has two read-modify-write
+// races that make its output non-deterministic on large graphs:
+//   1. It reads d_p.final_comm[my_final] AFTER other threads may have
+//      written to d_p.final_comm[my_final] (when those threads revert).
+//      Whether a given thread sees the original phase-1 value or the
+//      reverted value depends on kernel scheduling.
+//   2. It reads d_p.size[my_older] and d_p.size[my_final] concurrently
+//      with other threads' atomicAdd/atomicSub updates to the same
+//      community size counters; the value observed depends on scheduling.
+//
+// This variant eliminates both races by operating on pre-computed
+// snapshots of final_comm and size (taken immediately before launch via
+// cudaMemcpyAsync). The snapshots are not modified during the kernel, so
+// every thread sees the same well-defined input regardless of scheduling.
+// Writes to d_p.final_comm[i] are per-thread unique (no race), and the
+// final size delta is accumulated into per-node (old_comm, new_comm)
+// slots; the caller then applies those deltas with a separate
+// deterministic Thrust reduce_by_key + scatter pass.
+//
+// This matches the original kernel's SEMANTICS exactly (same swap
+// prevention, same size-bias tie-break) — it only changes the source
+// of the reads so that they are well-defined across thread scheduling.
+__global__ void find_community_phase2_det(
+    Leiden_Partition d_p,
+    graph            d_g,
+    const int*       final_snapshot,  // snapshot of d_p.final_comm BEFORE phase2
+    const int*       size_snapshot)   // snapshot of d_p.size        BEFORE phase2
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d_g.nodes) return;
+
+    int my_older = d_p.older_comm[i];
+    int my_final = final_snapshot[i];
+
+    // Race-free swap prevention (read other thread's DECISION from snapshot).
+    if (my_final < my_older && final_snapshot[my_final] == my_older) {
+        my_final = my_older;
+    }
+
+    // Race-free size-bias tie-break (read size from snapshot).
+    if (size_snapshot[my_older] > size_snapshot[my_final]
+        && size_snapshot[my_final] < size_snapshot[my_older]) {
+        my_final = my_older;
+    }
+
+    // Commit the final decision. No thread writes the same slot.
+    d_p.final_comm[i] = my_final;
+}
+
+// After find_community_phase2_det has written the final decisions into
+// d_p.final_comm, these two helpers rebuild d_p.size (nodes-per-community
+// counts) from scratch. Clear size[] to zero, then atomicAdd +1 per node
+// into size[final_comm[i]]. Integer atomicAdd is fully commutative and
+// associative, so the final value is deterministic regardless of the
+// order in which threads fire.
+__global__ void clear_size_kernel(int* size, int V)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < V) size[i] = 0;
+}
+
+__global__ void accumulate_size_kernel(const int* final_comm, int* size, int V)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < V) {
+        atomicAdd(&size[final_comm[i]], 1);
     }
 }
 
@@ -930,6 +1062,30 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
     cudaMalloc((void**)&d_p.nbrs, (V + E) * sizeof(int));
     cudaMalloc((void**)&d_p.pos, (V + 1) * sizeof(int));
 
+    // Phase 2.5b working buffers for deterministic community-stats recompute.
+    // Allocated once, reused across every outer iteration.
+    int*    d_sort_keys;
+    int*    d_sort_idx;
+    double* d_sorted_vals;
+    int*    d_reduced_keys;
+    double* d_reduced_vals;
+    double* d_per_node_internal;
+    cudaMalloc((void**)&d_sort_keys,         V * sizeof(int));
+    cudaMalloc((void**)&d_sort_idx,          V * sizeof(int));
+    cudaMalloc((void**)&d_sorted_vals,       V * sizeof(double));
+    cudaMalloc((void**)&d_reduced_keys,      V * sizeof(int));
+    cudaMalloc((void**)&d_reduced_vals,      V * sizeof(double));
+    cudaMalloc((void**)&d_per_node_internal, V * sizeof(double));
+
+    // Phase 2.5b snapshot buffers for deterministic phase-2 swap check.
+    // find_community_phase2_det reads from these instead of the live
+    // d_p.final_comm / d_p.size arrays so that its decisions are independent
+    // of thread scheduling.
+    int* d_final_snapshot;
+    int* d_size_snapshot;
+    cudaMalloc((void**)&d_final_snapshot, V * sizeof(int));
+    cudaMalloc((void**)&d_size_snapshot,  V * sizeof(int));
+
     // Copy data from host to device
     cudaMemcpy(d_p.node_comm, p.node_comm, V * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_p.size, p.size, V * sizeof(int), cudaMemcpyHostToDevice);
@@ -1005,15 +1161,56 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
             { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_phase1 += t; }
         }
 
-        // Phase 2: cross-node swap check + size update
+        // Phase 2 (Phase 2.5b deterministic variant): cross-node swap check
+        // + community-size update.
+        //
+        // The original find_community_phase2 had two read-modify-write races:
+        //   (a) reads d_p.final_comm[my_final] while other threads may be
+        //       writing d_p.final_comm[my_final] (reverting their own move);
+        //   (b) reads d_p.size[c] while other threads atomically update it.
+        // Both made phase2's output non-deterministic on large graphs (e.g.
+        // pcw13, merfish), which in turn produced run-to-run different labels
+        // even after Phase 2.5 fixed phase1 and Phase 2.5b fixed update_partition.
+        //
+        // Fix: snapshot d_p.final_comm and d_p.size into read-only buffers
+        // BEFORE the kernel runs; the new find_community_phase2_det kernel
+        // reads exclusively from the snapshots (race-free) and writes each
+        // node's decision into d_p.final_comm[i] (per-thread unique, race-free).
+        // Then we rebuild d_p.size from scratch by scattering integer +1s
+        // (integer atomicAdd is fully associative/commutative, deterministic).
         cudaEventRecord(ev_start);
-        find_community_phase2 <<< nbl, tpb >>>(d_p, d_g);
+        cudaMemcpyAsync(d_final_snapshot, d_p.final_comm,
+                        V * sizeof(int), cudaMemcpyDeviceToDevice);
+        cudaMemcpyAsync(d_size_snapshot,  d_p.size,
+                        V * sizeof(int), cudaMemcpyDeviceToDevice);
+        find_community_phase2_det <<< nbl, tpb >>>(
+            d_p, d_g, d_final_snapshot, d_size_snapshot);
+        // Rebuild size[] from the committed final_comm (deterministic).
+        clear_size_kernel      <<< nbl, tpb >>>(d_p.size, V);
+        accumulate_size_kernel <<< nbl, tpb >>>(d_p.final_comm, d_p.size, V);
         cudaEventRecord(ev_stop);
         cudaEventSynchronize(ev_stop);
         { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_phase2 += t; }
 
+        // Phase 2.5b: deterministic move + community-stats recompute
+        // (replaces the old atomicAdd-based update_partition).
+        //
+        //   1. apply_moves_assign_kernel: write d_p.node_comm[i] = d_p.final_comm[i]
+        //   2. (implicit sync via separate kernel launch)
+        //   3. apply_moves_home_kernel:   compute home_comm[i] from finalised node_comm
+        //   4. recompute_community_stats_gpu: rebuild tot_in / tot_out / sum_in via
+        //      thrust::sort_by_key + reduce_by_key + scatter (bit-deterministic).
         cudaEventRecord(ev_start);
-        update_partition <<< nbl, tpb >>>(d_p, d_g);
+        apply_moves_assign_kernel <<< nbl, tpb >>>(d_p, d_g);
+        cudaDeviceSynchronize();
+        apply_moves_home_kernel   <<< nbl, tpb >>>(d_p, d_g);
+        cudaDeviceSynchronize();
+        recompute_community_stats_gpu(
+            d_p, d_g, V,
+            d_sort_keys, d_sort_idx, d_sorted_vals,
+            d_reduced_keys, d_reduced_vals,
+            d_per_node_internal);
+        cudaDeviceSynchronize();
         cudaEventRecord(ev_stop);
         cudaEventSynchronize(ev_stop);
         { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_update += t; }
@@ -1097,6 +1294,16 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
     cudaFree(d_g.out_col);
     cudaFree(d_p.nbrs);
     cudaFree(d_p.pos);
+
+    // Phase 2.5b working buffers
+    cudaFree(d_sort_keys);
+    cudaFree(d_sort_idx);
+    cudaFree(d_sorted_vals);
+    cudaFree(d_reduced_keys);
+    cudaFree(d_reduced_vals);
+    cudaFree(d_per_node_internal);
+    cudaFree(d_final_snapshot);
+    cudaFree(d_size_snapshot);
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::minutes>(end_time - start_time);
