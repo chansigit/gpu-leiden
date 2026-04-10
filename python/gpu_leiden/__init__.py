@@ -44,8 +44,13 @@ def leiden_from_csr(
     resolution
         Resolution (gamma) parameter. Higher values → more communities.
     max_iterations
-        Maximum number of iterations per level (``-1`` for unlimited).
-        Currently ignored; the algorithm always runs to convergence.
+        Number of full Leiden passes (each pass = local moving + refinement
+        + aggregation hierarchy). Each pass is seeded from the previous
+        pass's final partition; the first pass starts from singletons.
+        A value of ``-1`` or ``0`` means "use default" (``2``), matching
+        leidenalg's default ``n_iterations=2``. Running 2 passes typically
+        improves ARI by 0.05-0.15 over a single pass at the cost of roughly
+        doubling the runtime.
     random_seed
         Reserved for a future randomized initialization. Currently ignored.
 

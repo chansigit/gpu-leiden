@@ -416,6 +416,174 @@ for (int i=0; i< p.neigh_pos.size(); i++)
     return p;
 }
 
+/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+// Variant of create_c_partition that initialises p.node_comm from a
+// caller-supplied array of initial labels instead of singletons.
+//
+// Used by leiden_from_csr's n_iterations outer loop: the second (and
+// subsequent) iterations need to seed the partition with the FINAL labels
+// from the previous iteration rather than starting fresh at singletons.
+//
+// The bookkeeping mirrors create_c_partition exactly except for the
+// community aggregation of tot_in / tot_out / sum_in, which must sum over
+// all nodes sharing an initial label. The sum_in convention matches
+// Leiden_CPU's incremental updates: for each node i in community c,
+// sum_in[c] accumulates self_loops[i] plus every internal out-edge AND
+// every internal in-edge to other members of c (each pair-direction
+// counted once, matching the doubled convention used throughout).
+Leiden_Partition create_c_partition_from_labels(graph& g, Leiden_Partition& p,
+                                                const int* initial_labels)
+{
+  p.in_deg = new double [g.nodes];
+  p.out_deg = new double [g.nodes];
+  p.tot_in = new double [g.nodes];
+  p.tot_out = new double [g.nodes];
+  p.sum_in = new double [g.nodes];
+  p.sum_kin = new double [g.nodes];
+  p.self_loops = new double [g.nodes];
+  p.node_comm = new int [g.nodes];
+  p.size = new int [g.nodes];
+  p.home_comm = new double [g.nodes];
+  p.final_comm=new int [g.nodes];
+  p.nbrs=new int [g.nodes + g.ed];
+  p.older_comm= new int[g.nodes];
+  p.pos=new int [g.nodes + 1];
+
+
+  for (int i=0; i< (g.nodes+g.ed); i++)
+  {
+    p.nbrs[i]=0;
+  }
+
+  for (int i=0; i< (g.nodes+1); i++)
+  {
+    p.pos[i]=0;
+  }
+
+  for (int i=0; i< g.nodes; i++)
+  {
+    p.node_comm[i]=initial_labels[i];
+    p.size[i]=0;
+    p.final_comm[i]=i;
+    p.in_deg[i]=0;
+    p.home_comm[i]=0;
+    p.out_deg[i]=0;
+    p.tot_in[i]=0;
+    p.tot_out[i]=0;
+    p.sum_kin[i]=0;
+    p.self_loops[i]=0;
+    p.sum_in[i]=0;
+    p.older_comm[i]=i;
+    p.weight=0;
+  }
+
+  // size[c] = number of nodes currently in community c
+  for (int i=0; i<g.nodes; i++)
+  {
+    p.size[initial_labels[i]]++;
+  }
+
+  // Per-node degrees and self-loop weights.
+  for (int i=0; i<g.nodes; i++)
+  {
+    p.in_deg[i]=indegree(g, p, i);
+    p.out_deg[i]=outdegree(g, p, i);
+    p.weight=p.weight+p.out_deg[i];
+    p.self_loops[i]=selfloop(g, p, i);
+  }
+
+  // Aggregate community degree totals from per-node degrees.
+  for (int i=0; i<g.nodes; i++)
+  {
+    int c = initial_labels[i];
+    p.tot_in[c]  += p.in_deg[i];
+    p.tot_out[c] += p.out_deg[i];
+    // Self-loops are always internal to whatever community the node lives in.
+    p.sum_in[c]  += p.self_loops[i];
+  }
+
+  // Internal edges (non-self-loop) contribute to sum_in[c]. Match the
+  // Leiden_CPU convention that counts both out-edges and in-edges to other
+  // members of the same community.
+  for (int v=0; v<g.nodes; v++)
+  {
+    int cv = initial_labels[v];
+    for (int e = g.out_col[v]; e < g.out_col[v+1]; e++)
+    {
+      int u = g.child_out[e];
+      if (u == v) continue;  // self-loop already counted
+      if (initial_labels[u] == cv)
+      {
+        p.sum_in[cv] += g.wts_out[e];
+      }
+    }
+    for (int e = g.in_col[v]; e < g.in_col[v+1]; e++)
+    {
+      int u = g.child_in[e];
+      if (u == v) continue;
+      if (initial_labels[u] == cv)
+      {
+        p.sum_in[cv] += g.wts_in[e];
+      }
+    }
+  }
+
+  // Candidate list for local moving. Layout matches create_c_partition:
+  // each node j gets an entry list starting with the node id j itself
+  // (which stands for "stay in my current community") followed by each
+  // neighbor node id whose community is DIFFERENT from j's community.
+  //
+  // Importantly, the entries are NODE IDS, not community ids. The GPU
+  // phase 1 kernel reads older_comm[nbrs[k]] to get the candidate
+  // community id, so nbrs[k] must be interpretable as a node index.
+  // This matches what create_c_partition produces implicitly via
+  // p.node_comm[child_out[i]] == child_out[i] under singleton init.
+  p.count.clear();
+  p.neigh_commNb.clear();
+  p.neigh_pos.clear();
+
+  int tot_inc=0;
+  p.count.push_back(0);
+  for (int j=0; j<g.nodes; j++)
+  {
+    int inc=0;
+    p.neigh_commNb.push_back(j);
+    int my_comm = initial_labels[j];
+    for (int i=g.out_col[j]; i<g.out_col[j+1]; i++)
+    {
+      int nbr_node = g.child_out[i];
+      int neigh_comm = initial_labels[nbr_node];
+      if (my_comm != neigh_comm)
+      {
+        p.neigh_commNb.push_back(nbr_node);
+        inc++;
+      }
+    }
+    tot_inc+=inc;
+    p.count.push_back(tot_inc);
+  }
+
+  for (size_t i=0; i< p.neigh_commNb.size(); i++)
+  {
+    p.nbrs[i]=p.neigh_commNb[i];
+  }
+
+  p.neigh_pos.push_back(0);
+  for (int j=1; j<g.nodes+1; j++)
+  {
+    int b=p.count[j]-p.count[j-1];
+    int index=p.neigh_pos[j-1];
+    p.neigh_pos.push_back(index+b+1);
+  }
+
+  for (size_t i=0; i< p.neigh_pos.size(); i++)
+  {
+    p.pos[i]=p.neigh_pos[i];
+  }
+
+  return p;
+}
+
 inline double selfloop(graph& g, Leiden_Partition& p, int v)
 {
  for(int j=g.out_col[v]; j< g.out_col[v+1]; j++)

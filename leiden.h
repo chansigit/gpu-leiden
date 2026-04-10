@@ -41,6 +41,12 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
                int* tracked_labels, int n_original);
 double find_quality_cpu(Leiden_Partition& p, graph& g);
 void refine_partition_cpu(Leiden_Partition& p, graph& g);
+// Like create_c_partition, but initializes node_comm[i] = initial_labels[i]
+// instead of singleton i. Used by the n_iterations outer loop in
+// leiden_from_csr so that subsequent iterations start from the previous
+// iteration's final partition, matching leidenalg's default behaviour.
+Leiden_Partition create_c_partition_from_labels(graph& g, Leiden_Partition& p,
+                                                const int* initial_labels);
 double ToOwnCommunity(int node, int community, double bestGain, int old_comm, Leiden_Partition& d_p, graph& d_g);
 double computGain(int node, int community, Leiden_Partition& d_p, graph& d_g);
 double find_to_own(Leiden_Partition& d_p, graph& d_g, double dncomm, int i, int community, int comm);
@@ -58,6 +64,9 @@ int leiden_from_csr(
     int n_in_edges,
     int n_nodes,
     double resolution,
+    // Number of full Leiden passes (local moving + refinement + aggregation
+    // hierarchy). Each pass is seeded from the previous pass's final
+    // partition. A value <= 0 means "use default" (2, matching leidenalg).
     int max_iterations,
     unsigned int random_seed,
     int* out_labels
