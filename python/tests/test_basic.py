@@ -25,11 +25,12 @@ def _two_cliques(n_per=20):
 
 
 def test_returns_int32_array():
-    adj = _two_cliques(n_per=10)
+    n_per = 10
+    adj = _two_cliques(n_per=n_per)
     labels = gpu_leiden.leiden_from_csr(adj, resolution=1.0)
     assert isinstance(labels, np.ndarray)
     assert labels.dtype == np.int32
-    assert labels.shape == (adj.shape[0],)
+    assert labels.shape == (2 * n_per,)
 
 
 def test_recovers_two_cliques():

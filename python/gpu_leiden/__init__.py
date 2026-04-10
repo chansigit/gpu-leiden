@@ -72,11 +72,11 @@ def leiden_from_csr(
     data = np.ascontiguousarray(csr.data, dtype=np.float64)
 
     return _core.leiden_from_csr(
-        indptr,
-        indices,
-        data,
-        n_nodes,
-        float(resolution),
-        int(max_iterations),
-        int(random_seed),
+        indptr=indptr,
+        indices=indices,
+        data=data,
+        n_nodes=n_nodes,
+        resolution=float(resolution),
+        max_iterations=int(max_iterations),
+        random_seed=int(random_seed),
     )
