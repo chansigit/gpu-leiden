@@ -154,84 +154,193 @@ __global__ void update_partition(Leiden_Partition d_p, graph d_g)
     }
 }
 
-__global__ void find_community(Leiden_Partition d_p, graph d_g)
+// Phase 0: refresh older_comm and clear home_comm before each iteration
+// This was formerly done at the start of find_community, but must be a
+// separate kernel so that other threads' reads of older_comm see the
+// finalized values (not a partial in-progress state).
+__global__ void prepare_iteration_kernel(
+    int* older_comm,
+    const int* node_comm,
+    double* home_comm,
+    int V)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < V) {
+        older_comm[i] = node_comm[i];
+        home_comm[i] = 0.0;
+    }
+}
 
-    double quality = 0.0;
-    double newGain = 0.0;
-    int best_comm, old_comm, mvs;
-    double imp = 0.0;
-    double prev_quality = 0.0;
-    double q_prev_it = 0;
-    double edg_wt = d_p.weight;
+// Phase 1: For each node, compute the best candidate community and write
+// final_comm[i] ONCE at the very end. All cross-thread memory dependencies
+// are read-only within this kernel (node_comm, older_comm, tot_in, tot_out,
+// in_deg, out_deg, self_loops, edge arrays, resolution, weight, nbrs, pos).
+//
+// Optimisation: single-pass edge accumulation. The OLD find_community called
+// find_to_own once per candidate community, scanning ALL edges each time
+// (O(degree * candidates)). This version scans edges ONCE and dispatches
+// each edge to the matching candidate slot via a linear scan over a small
+// local array (O(degree + candidates*avg_search)).
+__global__ void find_community_phase1(Leiden_Partition d_p, graph d_g)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d_g.nodes) return;
 
-    if (i < d_g.nodes)
-    {
-        double dnc;
-        double dnc2 = 0.0;
-        double bestGain = 0.0;
+    int old_comm = d_p.node_comm[i];   // equals older_comm[i] after prepare kernel
+    int cand_start = d_p.pos[i];
+    int cand_end   = d_p.pos[i + 1];
+    int num_cands  = cand_end - cand_start;
 
-        old_comm = d_p.node_comm[i];
-        d_p.older_comm[i] = d_p.node_comm[i];
-        d_p.home_comm[i] = 0;
+    if (num_cands <= 0) {
+        d_p.final_comm[i] = old_comm;
+        return;
+    }
 
-        double toc_in = 0;
-        double toc_out = 0;
-        int comm = 0;
-        double VertexToCommunity = 0.0;
+    double inv_weight  = 1.0 / d_p.weight;
+    double inv_weight2 = inv_weight * inv_weight;
 
-        // Iterate over neighboring communities
-        for (int community = d_p.pos[i]; community < d_p.pos[i + 1]; community++) 
-        { 
-            comm = d_p.older_comm[d_p.nbrs[community]];
-            double dncomm = 0.0;
+    int best_comm = old_comm;
+    double bestGain = 0.0;
 
-            dncomm = find_to_own(d_p, d_g, dncomm, i, community, comm, d_p.nbrs[community]);
+    const int MAX_LOCAL_CANDS = 32;
 
-            if (d_p.older_comm[i] == comm)
-            {
+    if (num_cands <= MAX_LOCAL_CANDS) {
+        // --- Fast path: single-pass edge accumulation via local arrays ---
+        int cand_comm[MAX_LOCAL_CANDS];
+        double cand_weight[MAX_LOCAL_CANDS];
+
+        // Load candidate community IDs (uses older_comm, same as the
+        // original find_community behaviour).
+        for (int c = 0; c < num_cands; c++) {
+            cand_comm[c]   = d_p.older_comm[d_p.nbrs[cand_start + c]];
+            cand_weight[c] = 0.0;
+        }
+
+        // Single pass over outgoing edges
+        for (int e = d_g.out_col[i]; e < d_g.out_col[i + 1]; e++) {
+            int target = d_g.child_out[e];
+            if (target == i) continue;
+            int target_comm = d_p.node_comm[target];
+            double w = d_g.wts_out[e];
+            for (int c = 0; c < num_cands; c++) {
+                if (cand_comm[c] == target_comm) {
+                    cand_weight[c] += w;
+                    break;
+                }
+            }
+        }
+
+        // Single pass over incoming edges
+        for (int e = d_g.in_col[i]; e < d_g.in_col[i + 1]; e++) {
+            int target = d_g.child_in[e];
+            if (target == i) continue;
+            int target_comm = d_p.node_comm[target];
+            double w = d_g.wts_in[e];
+            for (int c = 0; c < num_cands; c++) {
+                if (cand_comm[c] == target_comm) {
+                    cand_weight[c] += w;
+                    break;
+                }
+            }
+        }
+
+        // Find best community from accumulated weights
+        for (int c = 0; c < num_cands; c++) {
+            int comm     = cand_comm[c];
+            double dncomm = cand_weight[c];
+
+            double toc_in, toc_out;
+            if (old_comm == comm) {
                 toc_in  = d_p.tot_in[comm]  - d_p.in_deg[i];
                 toc_out = d_p.tot_out[comm] - d_p.out_deg[i];
-            }
-            else
-            {
+            } else {
                 toc_in  = d_p.tot_in[comm];
                 toc_out = d_p.tot_out[comm];
             }
 
-            newGain = (dncomm + d_p.self_loops[i]) / d_p.weight
-                      - d_p.resolution * ((toc_in * d_p.out_deg[i] + toc_out * d_p.in_deg[i]) / (d_p.weight * d_p.weight));
+            double newGain = (dncomm + d_p.self_loops[i]) * inv_weight
+                           - d_p.resolution * (toc_in * d_p.out_deg[i] + toc_out * d_p.in_deg[i]) * inv_weight2;
 
-            if (newGain > bestGain)                         
-            { 
+            if (newGain > bestGain) {
                 bestGain = newGain;
                 best_comm = comm;
-                VertexToCommunity = dncomm;
-            } 
-
-            d_p.final_comm[i] = best_comm;
+            }
         }
 
-        // Prevent swapping back and forth in some conditions
-        if (d_p.final_comm[i] < d_p.older_comm[i] &&
-            d_p.final_comm[d_p.final_comm[i]] == d_p.older_comm[i])
-        {
-            d_p.final_comm[i] = d_p.older_comm[i];
-        } 
+    } else {
+        // --- Fallback: multi-pass for very high-degree candidate lists ---
+        // Still race-free (final_comm is not written until end of kernel).
+        for (int community = cand_start; community < cand_end; community++) {
+            int comm = d_p.older_comm[d_p.nbrs[community]];
+            double dncomm = 0.0;
 
-        if (d_p.size[d_p.older_comm[i]] > d_p.size[d_p.final_comm[i]] &&
-            d_p.size[d_p.final_comm[i]] < d_p.size[d_p.older_comm[i]])
-        {
-            d_p.final_comm[i] = d_p.older_comm[i];
-        } 
+            // Inlined find_to_own (same match semantics as the original:
+            // node_comm[target] for current-pass matches)
+            for (int e = d_g.out_col[i]; e < d_g.out_col[i + 1]; e++) {
+                int target = d_g.child_out[e];
+                if (target != i && d_p.node_comm[target] == comm) {
+                    dncomm += d_g.wts_out[e];
+                }
+            }
+            for (int e = d_g.in_col[i]; e < d_g.in_col[i + 1]; e++) {
+                int target = d_g.child_in[e];
+                if (target != i && d_p.node_comm[target] == comm) {
+                    dncomm += d_g.wts_in[e];
+                }
+            }
 
-        // Update sizes atomically if community has changed
-        if (d_p.final_comm[i] != d_p.older_comm[i])
-        {
-            atomicSub(&d_p.size[d_p.older_comm[i]], 1);
-            atomicAdd(&d_p.size[d_p.final_comm[i]], 1);
+            double toc_in, toc_out;
+            if (old_comm == comm) {
+                toc_in  = d_p.tot_in[comm]  - d_p.in_deg[i];
+                toc_out = d_p.tot_out[comm] - d_p.out_deg[i];
+            } else {
+                toc_in  = d_p.tot_in[comm];
+                toc_out = d_p.tot_out[comm];
+            }
+
+            double newGain = (dncomm + d_p.self_loops[i]) * inv_weight
+                           - d_p.resolution * (toc_in * d_p.out_deg[i] + toc_out * d_p.in_deg[i]) * inv_weight2;
+
+            if (newGain > bestGain) {
+                bestGain = newGain;
+                best_comm = comm;
+            }
         }
+    }
+
+    // Write final_comm exactly ONCE, at the very end of the kernel.
+    // Phase 2 (next kernel launch) will read it after cudaDeviceSynchronize.
+    d_p.final_comm[i] = best_comm;
+}
+
+// Phase 2: Cross-node swap prevention + community size update.
+// Reads d_p.final_comm (fully written by phase1), d_p.older_comm, d_p.size.
+// Writes d_p.final_comm (possibly reverts), d_p.size (atomic).
+__global__ void find_community_phase2(Leiden_Partition d_p, graph d_g)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d_g.nodes) return;
+
+    int my_older = d_p.older_comm[i];
+    int my_final = d_p.final_comm[i];
+
+    // Prevent swaps: if i wants to move to j<i, and j wants to move to
+    // i's old community, stay put.
+    if (my_final < my_older && d_p.final_comm[my_final] == my_older) {
+        my_final = my_older;
+        d_p.final_comm[i] = my_older;
+    }
+
+    // Size bias (same as the original — prefer staying in the larger community)
+    if (d_p.size[my_older] > d_p.size[my_final] && d_p.size[my_final] < d_p.size[my_older]) {
+        my_final = my_older;
+        d_p.final_comm[i] = my_older;
+    }
+
+    // Update sizes atomically if community actually changed
+    if (my_final != my_older) {
+        atomicSub(&d_p.size[my_older], 1);
+        atomicAdd(&d_p.size[my_final], 1);
     }
 }
 
@@ -665,8 +774,17 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
         moves = 0;
         prev_quality = quality;
 
-        // Community kernels
-        find_community <<< nbl, tpb >>>(d_p, d_g);
+        // Phase 0: refresh older_comm and clear home_comm (race-free setup)
+        prepare_iteration_kernel <<< nbl, tpb >>>(
+            d_p.older_comm, d_p.node_comm, d_p.home_comm, V);
+        cudaDeviceSynchronize();
+
+        // Phase 1: pick best community per node (single-pass edge accumulation)
+        find_community_phase1 <<< nbl, tpb >>>(d_p, d_g);
+        cudaDeviceSynchronize();
+
+        // Phase 2: cross-node swap check + size update
+        find_community_phase2 <<< nbl, tpb >>>(d_p, d_g);
         cudaDeviceSynchronize();
 
         update_partition <<< nbl, tpb >>>(d_p, d_g);
