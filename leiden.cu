@@ -7,6 +7,15 @@
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/execution_policy.h>
+#include <thrust/unique.h>
+#include <thrust/binary_search.h>
+#include <thrust/reduce.h>
+#include <thrust/transform.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/copy.h>
+#include <algorithm>
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <iomanip>
@@ -400,161 +409,315 @@ __global__ void count_moves_kernel(const int* node_comm, const int* older_comm, 
     }
 }
 
+// =============================================================================
+// GPU graph aggregation helpers (Phase 2.2)
+// =============================================================================
+
+// Functor: pack a (src, dst) pair into a composite int64 key = src * K + dst.
+// Used for thrust::transform over zip(src, dst) -> key.
+struct MakeCompositeKey {
+    int K;
+    __host__ __device__
+    int64_t operator()(const thrust::tuple<int, int>& t) const {
+        return (int64_t)thrust::get<0>(t) * (int64_t)K + (int64_t)thrust::get<1>(t);
+    }
+};
+
+// Functor: split a composite int64 key back into (row, col) pair.
+struct SplitCompositeKey {
+    int K;
+    __host__ __device__
+    thrust::tuple<int, int> operator()(int64_t k) const {
+        int row = (int)(k / (int64_t)K);
+        int col = (int)(k - (int64_t)row * (int64_t)K);
+        return thrust::make_tuple(row, col);
+    }
+};
+
+// Kernel: build per-edge (new_src_comm, new_dst_comm, weight) triples
+// from the old CSR + the per-node new-community mapping.
+// One thread per source node; thread iterates the node's out-edges.
+__global__ void build_edge_triples_out(
+    const int*    out_col,
+    int           V,
+    const int*    child_out,
+    const double* wts_out,
+    const int*    new_comm,
+    int*          src_new,
+    int*          dst_new,
+    double*       wts_new)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= V) return;
+    int s = new_comm[i];
+    int e_end = out_col[i + 1];
+    for (int e = out_col[i]; e < e_end; e++) {
+        int t = child_out[e];
+        src_new[e] = s;
+        dst_new[e] = new_comm[t];
+        wts_new[e] = wts_out[e];
+    }
+}
+
 int renumber_communities(Leiden_Partition& p, graph& g,
                          int* tracked_labels, int n_original)
 {
-    unordered_map<int, vector<int>> comms;
-
-    // Group nodes by their community
-    for (int comm = 0; comm < g.nodes; comm++)
-    {
-        comms[p.node_comm[comm]].push_back(comm);
-    }
-
-    // Re-number communities and remove duplicates
-    vector<int> renumber_c;     
-    int community_range = 0;
-
-    for (auto it = comms.begin(); it != comms.end(); ++it)
-    {
-        renumber_c.push_back(it->first);
-        community_range++;
-    }
-
-    sort(renumber_c.begin(), renumber_c.end());
-
-    unordered_map<int, int> dummy_indexes;
-    for (int it = 0; it < renumber_c.size(); it++)
-    {
-        dummy_indexes[renumber_c[it]] = it;
-    }
-
-    // Apply dummy_indexes to tracked_labels: old community IDs -> new super-node IDs
-    // After this, tracked_labels[i] is a valid index into the aggregated graph's node_comm
-    if (tracked_labels != NULL) {
-        for (int i = 0; i < n_original; i++) {
-            tracked_labels[i] = dummy_indexes[tracked_labels[i]];
-        }
-    }
+    const int V_old = g.nodes;
+    const int E_old = g.ed;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    aggregate_adj adj;
-
-    // Build aggregated graph
-    for (int comm = 0; comm < community_range; comm++)                                                             
-    {
-        int community = renumber_c[comm];
-        const vector<int>& community_nodes = comms[community];
-
-        unordered_map<int, double> temp;
-        vector<pair<double, int>> temp_edges;
-
-        for (int node = 0; node < community_nodes.size(); node++)                                                                        
-        {
-            for (int neighbor = g.out_col[community_nodes[node]]; 
-                 neighbor < g.out_col[community_nodes[node] + 1]; neighbor++)                                             
-            {
-                int n_neig = g.child_out[neighbor]; 
-                double w_neig = g.wts_out[neighbor];
-                int neig_comm = p.node_comm[n_neig];
-                temp[dummy_indexes[neig_comm]] += w_neig;    
+    // ---------------------------------------------------------------
+    // Edge case: empty or single-node graph. Nothing to aggregate.
+    // ---------------------------------------------------------------
+    if (V_old <= 1 || E_old == 0) {
+        std::vector<int> sorted_comm(p.node_comm, p.node_comm + V_old);
+        std::sort(sorted_comm.begin(), sorted_comm.end());
+        sorted_comm.erase(std::unique(sorted_comm.begin(), sorted_comm.end()),
+                          sorted_comm.end());
+        if (tracked_labels != NULL) {
+            for (int i = 0; i < n_original; i++) {
+                int old_id = tracked_labels[i];
+                int new_id = (int)(std::lower_bound(sorted_comm.begin(),
+                                                    sorted_comm.end(),
+                                                    old_id) - sorted_comm.begin());
+                tracked_labels[i] = new_id;
             }
-        } 
+        }
 
-        for (const auto& entry : temp) 
-        {
-            temp_edges.push_back(make_pair(entry.second, entry.first));
-        }      
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::minutes>(end_time - start_time);
+        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+        cout << "Aggregate step on Device completed in " << duration.count() << " minutes!" << std::endl;
+        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+        cout << "____________________________________________" << endl;
+        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+        cout << "Preprocessing on Host completed in 0 minutes!" << std::endl;
+        cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+        cout << "____________________________________________" << endl;
+        return 0;
+    }
 
-        auto myCompare = [](const pair<double, int>& a, const pair<double, int>& b) {
-            return a.second < b.second;
-        };
+    // ---------------------------------------------------------------
+    // Stage A: upload p.node_comm and densify community IDs on the GPU
+    // ---------------------------------------------------------------
+    thrust::device_vector<int> d_node_comm(p.node_comm, p.node_comm + V_old);
 
-        sort(temp_edges.begin(), temp_edges.end(), myCompare);                           
-        adj.next_graph.push_back(temp_edges);  
-    } 
+    // Sort+unique of a copy gives the sorted array of distinct old community IDs.
+    thrust::device_vector<int> d_unique_comms = d_node_comm;
+    thrust::sort(d_unique_comms.begin(), d_unique_comms.end());
+    auto unique_end = thrust::unique(d_unique_comms.begin(), d_unique_comms.end());
+    int K = (int)(unique_end - d_unique_comms.begin());
+    d_unique_comms.resize(K);
+
+    // For each node, its new (dense) community id is lower_bound(unique, old_id).
+    thrust::device_vector<int> d_new_comm(V_old);
+    thrust::lower_bound(d_unique_comms.begin(), d_unique_comms.end(),
+                        d_node_comm.begin(), d_node_comm.end(),
+                        d_new_comm.begin());
+
+    // ---------------------------------------------------------------
+    // Stage B: relabel tracked_labels on the host
+    // ---------------------------------------------------------------
+    std::vector<int> h_unique_comms(K);
+    thrust::copy(d_unique_comms.begin(), d_unique_comms.end(), h_unique_comms.begin());
+
+    if (tracked_labels != NULL) {
+        for (int i = 0; i < n_original; i++) {
+            int old_id = tracked_labels[i];
+            int new_id = (int)(std::lower_bound(h_unique_comms.begin(),
+                                                h_unique_comms.end(),
+                                                old_id) - h_unique_comms.begin());
+            tracked_labels[i] = new_id;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Stage C: upload old out-CSR to the device
+    // ---------------------------------------------------------------
+    thrust::device_vector<int>    d_out_col(g.out_col, g.out_col + V_old + 1);
+    thrust::device_vector<int>    d_child_out(g.child_out, g.child_out + E_old);
+    thrust::device_vector<double> d_wts_out(g.wts_out, g.wts_out + E_old);
+
+    // ---------------------------------------------------------------
+    // Stage D: build per-edge (new_src, new_dst, weight) triples
+    // ---------------------------------------------------------------
+    thrust::device_vector<int>    d_src_new(E_old);
+    thrust::device_vector<int>    d_dst_new(E_old);
+    thrust::device_vector<double> d_wts_new(E_old);
+
+    {
+        int tpb = 256;
+        int nbl = (V_old + tpb - 1) / tpb;
+        build_edge_triples_out<<<nbl, tpb>>>(
+            thrust::raw_pointer_cast(d_out_col.data()),
+            V_old,
+            thrust::raw_pointer_cast(d_child_out.data()),
+            thrust::raw_pointer_cast(d_wts_out.data()),
+            thrust::raw_pointer_cast(d_new_comm.data()),
+            thrust::raw_pointer_cast(d_src_new.data()),
+            thrust::raw_pointer_cast(d_dst_new.data()),
+            thrust::raw_pointer_cast(d_wts_new.data()));
+        cudaDeviceSynchronize();
+    }
+
+    // Release sources we no longer need before allocating the sort buffers.
+    d_out_col.clear();     d_out_col.shrink_to_fit();
+    d_child_out.clear();   d_child_out.shrink_to_fit();
+    d_wts_out.clear();     d_wts_out.shrink_to_fit();
+    d_node_comm.clear();   d_node_comm.shrink_to_fit();
+    d_unique_comms.clear(); d_unique_comms.shrink_to_fit();
+
+    // ---------------------------------------------------------------
+    // Stage E: sort by (src, dst) composite key; reduce_by_key on weights
+    // ---------------------------------------------------------------
+    thrust::device_vector<int64_t> d_key(E_old);
+    thrust::transform(
+        thrust::make_zip_iterator(thrust::make_tuple(d_src_new.begin(), d_dst_new.begin())),
+        thrust::make_zip_iterator(thrust::make_tuple(d_src_new.end(),   d_dst_new.end())),
+        d_key.begin(),
+        MakeCompositeKey{K});
+
+    // The individual src/dst arrays are no longer needed; the composite key
+    // carries both. Freeing here keeps peak memory lower during the sort.
+    d_src_new.clear(); d_src_new.shrink_to_fit();
+    d_dst_new.clear(); d_dst_new.shrink_to_fit();
+
+    thrust::sort_by_key(d_key.begin(), d_key.end(), d_wts_new.begin());
+
+    // Reduce runs of identical keys: sum the weights.
+    thrust::device_vector<int64_t> d_key_reduced(E_old);
+    thrust::device_vector<double>  d_wts_reduced(E_old);
+    auto end_pair = thrust::reduce_by_key(
+        d_key.begin(), d_key.end(),
+        d_wts_new.begin(),
+        d_key_reduced.begin(),
+        d_wts_reduced.begin());
+    int E_new = (int)(end_pair.first - d_key_reduced.begin());
+    d_key_reduced.resize(E_new);
+    d_wts_reduced.resize(E_new);
+
+    // Free inputs to the reduction.
+    d_key.clear();     d_key.shrink_to_fit();
+    d_wts_new.clear(); d_wts_new.shrink_to_fit();
+
+    // ---------------------------------------------------------------
+    // Stage F: split key back to (new_src, new_dst) and build out-CSR
+    // ---------------------------------------------------------------
+    thrust::device_vector<int> d_new_src(E_new);
+    thrust::device_vector<int> d_new_dst(E_new);
+    thrust::transform(
+        d_key_reduced.begin(), d_key_reduced.end(),
+        thrust::make_zip_iterator(thrust::make_tuple(d_new_src.begin(), d_new_dst.begin())),
+        SplitCompositeKey{K});
+
+    d_key_reduced.clear(); d_key_reduced.shrink_to_fit();
+
+    // Build CSR row pointers: for each row r in [0, K], out_col[r] = index
+    // of the first edge whose src >= r. This is lower_bound over the sorted
+    // new_src array, indexed by a counting iterator [0, K].
+    thrust::device_vector<int> d_out_col_new(K + 1);
+    thrust::counting_iterator<int> row_iter(0);
+    thrust::lower_bound(
+        d_new_src.begin(), d_new_src.end(),
+        row_iter, row_iter + K + 1,
+        d_out_col_new.begin());
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::minutes>(end_time - start_time);
     cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-    cout << "Aggregate step on Device completed in " << duration.count() << " minutes!" << std::endl; 
+    cout << "Aggregate step on Device completed in " << duration.count() << " minutes!" << std::endl;
     cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
     cout << "____________________________________________" << endl;
 
-    int arcs = 0;
-
     auto start_time2 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < adj.next_graph.size(); i++)
-    {
-        for (int j = 0; j < adj.next_graph[i].size(); j++)
-        {
-            adj.in_neighbours[adj.next_graph[i][j].second].push_back({adj.next_graph[i][j].first, i});
-        }
 
-        arcs += adj.next_graph[i].size();
-    }
+    // ---------------------------------------------------------------
+    // Stage G: build in-CSR by re-sorting the reduced edge list
+    //          with the composite key inverted to (dst * K + src).
+    // ---------------------------------------------------------------
+    thrust::device_vector<int64_t> d_key_in(E_new);
+    thrust::transform(
+        thrust::make_zip_iterator(thrust::make_tuple(d_new_dst.begin(), d_new_src.begin())),
+        thrust::make_zip_iterator(thrust::make_tuple(d_new_dst.end(),   d_new_src.end())),
+        d_key_in.begin(),
+        MakeCompositeKey{K});
 
-    g.nodes = adj.next_graph.size();
-    adj.len = adj.next_graph.size();
-    adj.edges = arcs;
-    g.ed = arcs;
+    // Weights follow the key permutation; make a working copy so the
+    // already-ordered out-CSR weights (d_wts_reduced) stay intact.
+    thrust::device_vector<double> d_wts_in(d_wts_reduced);
+    thrust::sort_by_key(d_key_in.begin(), d_key_in.end(), d_wts_in.begin());
 
-    g.out_col = new int[(adj.len + 1)];
-    g.in_col  = new int[(adj.len + 1)];
-    g.out_col[0] = 0; 
+    // Split the permuted key back into (row=dst, col=src) arrays.
+    thrust::device_vector<int> d_in_rows(E_new);
+    thrust::device_vector<int> d_in_cols(E_new);
+    thrust::transform(
+        d_key_in.begin(), d_key_in.end(),
+        thrust::make_zip_iterator(thrust::make_tuple(d_in_rows.begin(), d_in_cols.begin())),
+        SplitCompositeKey{K});
 
-    int valu = 0;
-    for (int idx = 0; idx < adj.next_graph.size(); idx++) 
-    {
-        valu += adj.next_graph[idx].size();
-        g.out_col[idx + 1] = valu;
-    }
+    d_key_in.clear(); d_key_in.shrink_to_fit();
 
-    g.in_col[0] = 0; 
-    int s = 0;
-    for (int idx = 0; idx < adj.in_neighbours.size(); idx++) 
-    {
-        s += adj.in_neighbours[idx].size();
-        g.in_col[idx + 1] = s;
-    }
+    thrust::device_vector<int> d_in_col_new(K + 1);
+    thrust::counting_iterator<int> row_iter2(0);
+    thrust::lower_bound(
+        d_in_rows.begin(), d_in_rows.end(),
+        row_iter2, row_iter2 + K + 1,
+        d_in_col_new.begin());
 
-    g.child_out = new int[adj.edges];
-    g.child_in  = new int[adj.edges];
-    g.wts_out   = new double[adj.edges];
-    g.wts_in    = new double[adj.edges];
+    d_in_rows.clear(); d_in_rows.shrink_to_fit();
 
-    int weight_index = 0;
-    int node_index = 0;
-    for (int i = 0; i < adj.next_graph.size(); i++)
-    { 
-        for (int j = 0; j < adj.next_graph[i].size(); j++)
-        {
-            g.child_out[node_index++] = adj.next_graph[i][j].second;
-            g.wts_out[weight_index++] = adj.next_graph[i][j].first;
-        }
-    }
+    // ---------------------------------------------------------------
+    // Stage H: copy results back to the host graph.
+    // ---------------------------------------------------------------
+    // Free old host-side CSR arrays (allocated with new[] by graph_process
+    // or a previous renumber_communities call).
+    delete[] g.out_col;
+    delete[] g.in_col;
+    delete[] g.child_out;
+    delete[] g.child_in;
+    delete[] g.wts_out;
+    delete[] g.wts_in;
 
-    int weight_index1 = 0;
-    int node_index1 = 0;
-    for (int i = 0; i < adj.in_neighbours.size(); i++)
-    { 
-        const vector<pair<double, int>> neighs = adj.in_neighbours[i];
-        for (int j = 0; j < neighs.size(); j++)
-        {
-            g.child_in[node_index1++] = neighs[j].second;
-            g.wts_in[weight_index1++] = neighs[j].first;
-        }
-    }
+    g.nodes     = K;
+    g.ed        = E_new;
+    g.out_col   = new int[K + 1];
+    g.in_col    = new int[K + 1];
+    g.child_out = new int[E_new];
+    g.child_in  = new int[E_new];
+    g.wts_out   = new double[E_new];
+    g.wts_in    = new double[E_new];
 
+    thrust::copy(d_out_col_new.begin(), d_out_col_new.end(), g.out_col);
+    thrust::copy(d_new_dst.begin(),     d_new_dst.end(),     g.child_out);
+    thrust::copy(d_wts_reduced.begin(), d_wts_reduced.end(), g.wts_out);
+
+    thrust::copy(d_in_col_new.begin(),  d_in_col_new.end(),  g.in_col);
+    thrust::copy(d_in_cols.begin(),     d_in_cols.end(),     g.child_in);
+    thrust::copy(d_wts_in.begin(),      d_wts_in.end(),      g.wts_in);
+
+    // Release the remaining device buffers explicitly before create_partition
+    // allocates more host-side arrays.
+    d_out_col_new.clear(); d_out_col_new.shrink_to_fit();
+    d_in_col_new.clear();  d_in_col_new.shrink_to_fit();
+    d_new_src.clear();     d_new_src.shrink_to_fit();
+    d_new_dst.clear();     d_new_dst.shrink_to_fit();
+    d_wts_reduced.clear(); d_wts_reduced.shrink_to_fit();
+    d_in_cols.clear();     d_in_cols.shrink_to_fit();
+    d_wts_in.clear();      d_wts_in.shrink_to_fit();
+
+    // ---------------------------------------------------------------
+    // Stage I: initialise the partition for the aggregated graph and recurse.
+    // ---------------------------------------------------------------
     create_partition(g, p);
+
     auto end_time2 = std::chrono::high_resolution_clock::now();
     auto duration2 = std::chrono::duration_cast<std::chrono::minutes>(end_time2 - start_time2);
     cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
-    cout << "Preprocessing on Host completed in " << duration2.count() << " minutes!" << std::endl; 
+    cout << "Preprocessing on Host completed in " << duration2.count() << " minutes!" << std::endl;
     cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
     cout << "____________________________________________" << endl;
-    
+
     Leiden_GPU(p, g, g.ed, tracked_labels, n_original);
 
     return 0;
