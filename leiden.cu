@@ -182,23 +182,27 @@ __global__ void prepare_iteration_kernel(
 
 // Phase 1 (warp-cooperative): one warp per node, edges parallelized across lanes.
 //
-// Each warp uses a slice of shared memory holding (cand_comm[MAX_LOCAL_CANDS],
-// cand_weight[MAX_LOCAL_CANDS]) for its node. With block size 512 (16 warps),
-// per-block shared memory = 16 * (128*4 + 128*8) = 24 KB, well within the
-// 100 KB/SM limit on sm_80.
+// Each warp processes candidates in chunks of MAX_CHUNK (=32). The warp's
+// shared-memory slice holds only cand_comm[MAX_CHUNK] for the current chunk
+// (the per-candidate weight accumulators now live in per-lane local memory
+// and are reduced via warp shuffles rather than shared-memory atomics). With
+// block size 512 (16 warps), per-block shared memory = 16 * (32*4) = 2 KB.
 //
-// For nodes with num_cands > MAX_LOCAL_CANDS the warp processes candidates
-// in chunks of MAX_LOCAL_CANDS: for each chunk, (a) load the chunk's cand
-// IDs, (b) scan all edges and accumulate weights into the current chunk's
-// slots, (c) compute gains and update the warp-wide best. Cost per node is
-// O(ceil(num_cands / MAX_LOCAL_CANDS) * degree), distributed over 32 lanes.
-#define PHASE1_WARP_MAX_CANDS 128
+// Deterministic accumulation: each lane maintains its own private
+// chunk_weights[MAX_CHUNK] array (spills to per-thread local memory, but
+// indexed coalescedly across lanes and L1-cached). Per candidate c in the
+// chunk, a butterfly __shfl_down_sync reduction with fixed offsets
+// (16,8,4,2,1) sums the 32 lanes' contributions in a fixed tree order,
+// yielding bit-identical results across runs. Lane c then computes the
+// gain for its candidate and updates a per-lane running best; a final
+// __shfl_xor_sync butterfly reduction picks the overall warp best.
+#define PHASE1_WARP_CHUNK 32
 
 __global__ void find_community_phase1_warp(Leiden_Partition d_p, graph d_g)
 {
     extern __shared__ unsigned char smem[];
     const int WARP_SIZE = 32;
-    const int MAX_LOCAL_CANDS = PHASE1_WARP_MAX_CANDS;
+    const int MAX_CHUNK = PHASE1_WARP_CHUNK;
 
     int warps_per_block = blockDim.x / WARP_SIZE;
     int warp_id_in_block = threadIdx.x / WARP_SIZE;
@@ -208,10 +212,10 @@ __global__ void find_community_phase1_warp(Leiden_Partition d_p, graph d_g)
 
     if (i >= d_g.nodes) return;
 
-    // Per-warp shared memory slice: [int cand_comm[N]][double cand_weight[N]]
-    const int slice_bytes = MAX_LOCAL_CANDS * sizeof(int) + MAX_LOCAL_CANDS * sizeof(double);
-    int* sh_cand_comm   = (int*)(smem + warp_id_in_block * slice_bytes);
-    double* sh_cand_weight = (double*)(sh_cand_comm + MAX_LOCAL_CANDS);
+    // Per-warp shared memory slice: only cand_comm[MAX_CHUNK] (read-only
+    // across the warp once the chunk header is loaded). Weights are
+    // accumulated in per-lane local memory, not here.
+    int* sh_cand_comm = (int*)(smem + warp_id_in_block * (MAX_CHUNK * sizeof(int)));
 
     int old_comm = d_p.node_comm[i];
     int cand_start = d_p.pos[i];
@@ -235,24 +239,32 @@ __global__ void find_community_phase1_warp(Leiden_Partition d_p, graph d_g)
     int e_in_start  = d_g.in_col[i];
     int e_in_end    = d_g.in_col[i + 1];
 
-    // Warp-wide best over all chunks
-    double bestGain = 0.0;
-    int    best_comm = old_comm;
+    // Per-lane running best over all chunks; merged across lanes at the end.
+    double running_best_gain = 0.0;
+    int    running_best_comm = old_comm;
 
-    // Process candidates in chunks of up to MAX_LOCAL_CANDS
-    for (int chunk_start = 0; chunk_start < num_cands; chunk_start += MAX_LOCAL_CANDS) {
-        int chunk_end = chunk_start + MAX_LOCAL_CANDS;
+    // Process candidates in chunks of up to MAX_CHUNK (32)
+    for (int chunk_start = 0; chunk_start < num_cands; chunk_start += MAX_CHUNK) {
+        int chunk_end = chunk_start + MAX_CHUNK;
         if (chunk_end > num_cands) chunk_end = num_cands;
         int chunk_size = chunk_end - chunk_start;
 
-        // Load this chunk's candidate community IDs and zero its weights
-        for (int c = lane; c < chunk_size; c += WARP_SIZE) {
-            sh_cand_comm[c]   = d_p.older_comm[d_p.nbrs[cand_start + chunk_start + c]];
-            sh_cand_weight[c] = 0.0;
+        // Load this chunk's candidate community IDs. With MAX_CHUNK == WARP_SIZE,
+        // each lane loads at most one entry.
+        if (lane < chunk_size) {
+            sh_cand_comm[lane] = d_p.older_comm[d_p.nbrs[cand_start + chunk_start + lane]];
         }
         __syncwarp();
 
-        // Outgoing edges, stride-32 across the warp
+        // Per-lane private accumulators for THIS chunk. Dynamic indexing
+        // forces spill to local memory, which is OK: accesses are
+        // coalesced across lanes and L1-cached.
+        double chunk_weights[MAX_CHUNK];
+        #pragma unroll
+        for (int c = 0; c < MAX_CHUNK; c++) chunk_weights[c] = 0.0;
+
+        // Outgoing edges, stride-32 across the warp. Each lane accumulates
+        // into ITS own chunk_weights[] — no cross-lane race.
         for (int e = e_out_start + lane; e < e_out_end; e += WARP_SIZE) {
             int target = d_g.child_out[e];
             if (target == i) continue;
@@ -260,7 +272,7 @@ __global__ void find_community_phase1_warp(Leiden_Partition d_p, graph d_g)
             double w = d_g.wts_out[e];
             for (int c = 0; c < chunk_size; c++) {
                 if (sh_cand_comm[c] == target_comm) {
-                    atomicAdd(&sh_cand_weight[c], w);
+                    chunk_weights[c] += w;  // lane-private, deterministic
                     break;
                 }
             }
@@ -274,51 +286,70 @@ __global__ void find_community_phase1_warp(Leiden_Partition d_p, graph d_g)
             double w = d_g.wts_in[e];
             for (int c = 0; c < chunk_size; c++) {
                 if (sh_cand_comm[c] == target_comm) {
-                    atomicAdd(&sh_cand_weight[c], w);
+                    chunk_weights[c] += w;  // lane-private, deterministic
                     break;
                 }
             }
         }
-        __syncwarp();
 
-        // Compute per-chunk gains and update per-lane best
-        for (int c = lane; c < chunk_size; c += WARP_SIZE) {
-            int comm = sh_cand_comm[c];
-            double dncomm = sh_cand_weight[c];
-
-            double toc_in, toc_out;
-            if (old_comm == comm) {
-                toc_in  = d_p.tot_in[comm]  - in_i;
-                toc_out = d_p.tot_out[comm] - out_i;
-            } else {
-                toc_in  = d_p.tot_in[comm];
-                toc_out = d_p.tot_out[comm];
+        // Deterministic per-candidate warp reduction. For each candidate c
+        // in the chunk, sum chunk_weights[c] across all 32 lanes via a
+        // butterfly __shfl_down_sync with fixed offsets (16, 8, 4, 2, 1).
+        // ALL lanes participate in every shuffle — putting the shuffle
+        // inside an `if (lane == c)` branch would be divergent and hang.
+        for (int c = 0; c < chunk_size; c++) {
+            double val = chunk_weights[c];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                val += __shfl_down_sync(0xffffffff, val, off);
             }
+            // After the tree reduction, lane 0 holds the total. Broadcast
+            // to the owner lane (c), which updates its per-lane running best.
+            double total = __shfl_sync(0xffffffff, val, 0);
 
-            double gain = (dncomm + self_i) * inv_w
-                        - res * (toc_in * out_i + toc_out * in_i) * inv_w2;
+            if (lane == c) {
+                int comm = sh_cand_comm[c];
+                double dncomm = total;
 
-            if (gain > bestGain) {
-                bestGain = gain;
-                best_comm = comm;
+                double toc_in, toc_out;
+                if (old_comm == comm) {
+                    toc_in  = d_p.tot_in[comm]  - in_i;
+                    toc_out = d_p.tot_out[comm] - out_i;
+                } else {
+                    toc_in  = d_p.tot_in[comm];
+                    toc_out = d_p.tot_out[comm];
+                }
+
+                double gain = (dncomm + self_i) * inv_w
+                            - res * (toc_in * out_i + toc_out * in_i) * inv_w2;
+
+                if (gain > running_best_gain) {
+                    running_best_gain = gain;
+                    running_best_comm = comm;
+                }
             }
         }
         __syncwarp();
     }
 
-    // Warp reduction: find max bestGain across lanes (with corresponding best_comm).
-    // Matches the original kernel's "strictly improves bestGain (starts at 0)" rule.
+    // Final warp-shuffle butterfly reduction: merge the 32 per-lane
+    // running bests into one warp-wide best. Lanes that were never the
+    // owner of any candidate (e.g. lanes >= chunk_size on the last
+    // chunk, when the node has fewer total candidates) carry the
+    // default (running_best_gain == 0.0, running_best_comm == old_comm),
+    // which is the correct "no-op" fallback.
+    #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        double other_gain = __shfl_xor_sync(0xffffffff, bestGain, offset);
-        int    other_comm = __shfl_xor_sync(0xffffffff, best_comm, offset);
-        if (other_gain > bestGain) {
-            bestGain = other_gain;
-            best_comm = other_comm;
+        double other_gain = __shfl_xor_sync(0xffffffff, running_best_gain, offset);
+        int    other_comm = __shfl_xor_sync(0xffffffff, running_best_comm, offset);
+        if (other_gain > running_best_gain) {
+            running_best_gain = other_gain;
+            running_best_comm = other_comm;
         }
     }
 
     if (lane == 0) {
-        d_p.final_comm[i] = best_comm;
+        d_p.final_comm[i] = running_best_comm;
     }
 }
 
@@ -956,13 +987,16 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
         cudaEventSynchronize(ev_stop);
         { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_prepare += t; }
 
-        // Phase 1: pick best community per node (warp-cooperative + fallback).
+        // Phase 1: pick best community per node (warp-cooperative).
         // Block size 512 => 16 warps/block; each warp handles one node.
+        // Per-warp shared memory is just cand_comm[PHASE1_WARP_CHUNK] ints;
+        // per-candidate weight accumulators live in per-lane local memory
+        // and are combined via deterministic warp-shuffle reductions.
         {
             int warps_per_block = tpb / 32;
             int warp_blocks = (V + warps_per_block - 1) / warps_per_block;
             size_t shared_bytes = (size_t)warps_per_block *
-                (PHASE1_WARP_MAX_CANDS * sizeof(int) + PHASE1_WARP_MAX_CANDS * sizeof(double));
+                (PHASE1_WARP_CHUNK * sizeof(int));
 
             cudaEventRecord(ev_start);
             find_community_phase1_warp <<< warp_blocks, tpb, shared_bytes >>>(d_p, d_g);
