@@ -1020,6 +1020,20 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
     cudaMemcpy(p.tot_out, d_p.tot_out, V * sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(p.older_comm, d_p.older_comm, V * sizeof(int), cudaMemcpyDeviceToHost);
 
+    // Leiden refinement step (CPU). Replaces p.node_comm with the refined
+    // partition and recomputes p.tot_in / p.tot_out / p.sum_in accordingly.
+    // Refinement typically yields more (smaller) communities than the raw
+    // local-moving result, which improves downstream ARI on large graphs.
+    {
+        auto refine_t0 = std::chrono::high_resolution_clock::now();
+        refine_partition_cpu(p, g);
+        auto refine_t1 = std::chrono::high_resolution_clock::now();
+        long refine_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             refine_t1 - refine_t0)
+                             .count();
+        printf("REFINE: %ld ms\n", refine_ms);
+    }
+
     // Free device memory
     cudaFree(d_p.node_comm);
     cudaFree(d_p.size);

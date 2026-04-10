@@ -526,4 +526,170 @@ void free_part(Leiden_Partition& p)
   delete[] p.pos;
   delete[] p.size;
 }
+/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+// Leiden refinement (CPU, OpenMP over parent communities).
+//
+// Replaces p.node_comm (currently the local-moving partition P) with the
+// refined partition P_refined. Each parent community c in P is refined
+// independently by starting its members as singletons and running a
+// constrained greedy local move (candidate sub-communities restricted to
+// nodes whose parent community is c).
+//
+// After refinement, p.tot_in, p.tot_out, and p.sum_in are recomputed for
+// the refined partition using the same convention as Leiden_CPU:
+//   sum_in[c] counts self-loops once per node, and for each (u,v) internal
+//   edge with both endpoints in c, counts it once from out-edges and once
+//   from in-edges (i.e., the internal weight is effectively doubled for
+//   directed-pair edges, matching the existing code).
+void refine_partition_cpu(Leiden_Partition& p, graph& g)
+{
+    int V = g.nodes;
+    double w = p.weight;
+    double res = p.resolution;
+
+    // 1) save parent partition P
+    std::vector<int> orig_comm(V);
+    for (int i = 0; i < V; i++) orig_comm[i] = p.node_comm[i];
+
+    // 2) reset to singletons
+    for (int i = 0; i < V; i++) p.node_comm[i] = i;
+
+    // Group vertices by parent community. We use a dense bucket based on
+    // the range of orig_comm values so iteration order is deterministic and
+    // we can trivially parallelize over distinct parent communities.
+    // Use std::map to get deterministic ordered iteration (important for
+    // reproducibility across runs).
+    std::map<int, std::vector<int> > by_orig;
+    for (int i = 0; i < V; i++) {
+        by_orig[orig_comm[i]].push_back(i);
+    }
+
+    std::vector<int> orig_ids;
+    orig_ids.reserve(by_orig.size());
+    for (std::map<int, std::vector<int> >::iterator it = by_orig.begin();
+         it != by_orig.end(); ++it) {
+        orig_ids.push_back(it->first);
+    }
+
+    // 3) refine each parent community independently
+    int n_parents = (int)orig_ids.size();
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int idx = 0; idx < n_parents; idx++) {
+        int c = orig_ids[idx];
+        const std::vector<int>& verts = by_orig[c];
+        if (verts.size() <= 1) continue;  // singleton parent — nothing to refine
+
+        // Local sub-community degree stats, keyed by sub-community id (node id).
+        // std::map for deterministic iteration order.
+        std::map<int, double> sub_tot_in;
+        std::map<int, double> sub_tot_out;
+        std::map<int, double> sub_sum_in;
+
+        for (size_t k = 0; k < verts.size(); k++) {
+            int v = verts[k];
+            sub_tot_in[v]  = p.in_deg[v];
+            sub_tot_out[v] = p.out_deg[v];
+            sub_sum_in[v]  = p.self_loops[v];
+        }
+
+        double inv_w  = 1.0 / w;
+        double inv_w2 = inv_w * inv_w;
+
+        // Greedy sweep: each vertex tries to join the best sub-community
+        // composed of neighbors whose PARENT community is still c.
+        for (size_t k = 0; k < verts.size(); k++) {
+            int v = verts[k];
+            int my_sub = p.node_comm[v];
+
+            // Accumulate weight from v to each candidate sub (use std::map
+            // for deterministic iteration order).
+            std::map<int, double> dnc;
+            for (int e = g.out_col[v]; e < g.out_col[v + 1]; e++) {
+                int u = g.child_out[e];
+                if (u == v) continue;
+                if (orig_comm[u] != c) continue;
+                dnc[p.node_comm[u]] += g.wts_out[e];
+            }
+            for (int e = g.in_col[v]; e < g.in_col[v + 1]; e++) {
+                int u = g.child_in[e];
+                if (u == v) continue;
+                if (orig_comm[u] != c) continue;
+                dnc[p.node_comm[u]] += g.wts_in[e];
+            }
+
+            double dv_in  = p.in_deg[v];
+            double dv_out = p.out_deg[v];
+            double sl_v   = p.self_loops[v];
+
+            // Remove v from its current sub (bookkeeping mirrors Leiden_CPU).
+            double dnc_self = 0.0;
+            std::map<int, double>::iterator it_self = dnc.find(my_sub);
+            if (it_self != dnc.end()) dnc_self = it_self->second;
+
+            sub_tot_in[my_sub]  -= dv_in;
+            sub_tot_out[my_sub] -= dv_out;
+            sub_sum_in[my_sub]  -= dnc_self + sl_v;
+
+            // Find best candidate sub-community.
+            int best_sub = my_sub;
+            double best_gain = 0.0;
+            for (std::map<int, double>::iterator it = dnc.begin();
+                 it != dnc.end(); ++it) {
+                int sub = it->first;
+                double dncomm = it->second;
+                double toc_in  = sub_tot_in[sub];
+                double toc_out = sub_tot_out[sub];
+                double gain = (dncomm + sl_v) * inv_w
+                            - res * (toc_in * dv_out + toc_out * dv_in) * inv_w2;
+                if (gain > best_gain) {
+                    best_gain = gain;
+                    best_sub = sub;
+                }
+            }
+
+            // Re-insert v into best_sub (may equal my_sub).
+            double best_dnc = 0.0;
+            std::map<int, double>::iterator it_best = dnc.find(best_sub);
+            if (it_best != dnc.end()) best_dnc = it_best->second;
+
+            sub_tot_in[best_sub]  += dv_in;
+            sub_tot_out[best_sub] += dv_out;
+            sub_sum_in[best_sub]  += best_dnc + sl_v;
+
+            p.node_comm[v] = best_sub;
+        }
+    }
+
+    // 4) Recompute global tot_in / tot_out / sum_in for the refined partition.
+    for (int i = 0; i < V; i++) {
+        p.tot_in[i]  = 0.0;
+        p.tot_out[i] = 0.0;
+        p.sum_in[i]  = 0.0;
+    }
+    for (int v = 0; v < V; v++) {
+        int c = p.node_comm[v];
+        p.tot_in[c]  += p.in_deg[v];
+        p.tot_out[c] += p.out_deg[v];
+    }
+    for (int v = 0; v < V; v++) {
+        int cv = p.node_comm[v];
+        // Self-loops counted once (matches convention: dnc excludes self-loops,
+        // self_loops[v] is added separately in Leiden_CPU bookkeeping).
+        p.sum_in[cv] += p.self_loops[v];
+        for (int e = g.out_col[v]; e < g.out_col[v + 1]; e++) {
+            int u = g.child_out[e];
+            if (u == v) continue;
+            if (p.node_comm[u] == cv) {
+                p.sum_in[cv] += g.wts_out[e];
+            }
+        }
+        for (int e = g.in_col[v]; e < g.in_col[v + 1]; e++) {
+            int u = g.child_in[e];
+            if (u == v) continue;
+            if (p.node_comm[u] == cv) {
+                p.sum_in[cv] += g.wts_in[e];
+            }
+        }
+    }
+}
 
