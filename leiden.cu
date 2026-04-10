@@ -255,17 +255,17 @@ struct QualityFunctor {
     const double* sum_in;
     const double* tot_in;
     const double* tot_out;
-    double weight;
+    double inv_weight;  // precomputed 1.0/weight
     double resolution;
 
     __host__ __device__
     QualityFunctor(const double* si, const double* ti, const double* to, double w, double r)
-        : sum_in(si), tot_in(ti), tot_out(to), weight(w), resolution(r) {}
+        : sum_in(si), tot_in(ti), tot_out(to), inv_weight(1.0 / w), resolution(r) {}
 
     __host__ __device__
     double operator()(int i) const {
         if (tot_in[i] > 0 || tot_out[i] > 0) {
-            return sum_in[i] - resolution * (tot_in[i] * tot_out[i] / weight);
+            return sum_in[i] - resolution * (tot_in[i] * tot_out[i] * inv_weight);
         }
         return 0.0;
     }
