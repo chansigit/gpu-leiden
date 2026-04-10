@@ -9,40 +9,6 @@ new quality: 0.232490  imp = 0.012363
 new quality: 0.240932  imp = 0.008442
 new quality: 0.241202  imp = 0.000270
 PROFILE V=100 iters=7  prepare=0.0 phase1=0.1 phase2=0.0 update=0.1 count=0.1 quality=0.1 total=0.5 ms
-REFINE: 8 ms
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Leiden step completed in 0 minutes!
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-____________________________________________
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Aggregate step on Device completed in 0 minutes!
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-____________________________________________
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Preprocessing on Host completed in 0 minutes!
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-____________________________________________
-previous quality: 0.241202
-new quality: 0.259794  imp = 0.018592
-new quality: 0.258658  imp = -0.001136
-PROFILE V=41 iters=2  prepare=0.0 phase1=0.0 phase2=0.0 update=0.1 count=0.0 quality=0.0 total=0.1 ms
-REFINE: 2 ms
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Leiden step completed in 0 minutes!
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-____________________________________________
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Aggregate step on Device completed in 0 minutes!
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-____________________________________________
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Preprocessing on Host completed in 0 minutes!
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-____________________________________________
-previous quality: 0.258658
-new quality: 0.269450  imp = 0.010792
-new quality: 0.269654  imp = 0.000204
-PROFILE V=16 iters=2  prepare=0.0 phase1=0.0 phase2=0.0 update=0.0 count=0.0 quality=0.0 total=0.1 ms
 REFINE: 0 ms
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Leiden step completed in 0 minutes!
@@ -56,8 +22,47 @@ ____________________________________________
 Preprocessing on Host completed in 0 minutes!
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ____________________________________________
-previous quality: 0.269654
-new quality: 0.271789  imp = 0.002135
+previous quality: 0.167288
+new quality: 0.196621  imp = 0.029333
+new quality: 0.237237  imp = 0.040616
+new quality: 0.252535  imp = 0.015297
+new quality: 0.262301  imp = 0.009766
+new quality: 0.270388  imp = 0.008087
+new quality: 0.271120  imp = 0.000732
+PROFILE V=41 iters=6  prepare=0.0 phase1=0.1 phase2=0.0 update=0.2 count=0.1 quality=0.1 total=0.4 ms
+REFINE: 0 ms
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Leiden step completed in 0 minutes!
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+____________________________________________
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Aggregate step on Device completed in 0 minutes!
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+____________________________________________
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Preprocessing on Host completed in 0 minutes!
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+____________________________________________
+previous quality: 0.247705
+new quality: 0.254842  imp = 0.007137
+new quality: 0.264840  imp = 0.009997
+new quality: 0.264840  imp = 0.000000
+PROFILE V=16 iters=3  prepare=0.0 phase1=0.0 phase2=0.0 update=0.1 count=0.0 quality=0.1 total=0.2 ms
+REFINE: 0 ms
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Leiden step completed in 0 minutes!
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+____________________________________________
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Aggregate step on Device completed in 0 minutes!
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+____________________________________________
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Preprocessing on Host completed in 0 minutes!
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+____________________________________________
+previous quality: 0.274010
+new quality: 0.275688  imp = 0.001678
 PROFILE V=8 iters=1  prepare=0.0 phase1=0.0 phase2=0.0 update=0.0 count=0.0 quality=0.0 total=0.1 ms
 REFINE: 0 ms
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -72,9 +77,9 @@ ____________________________________________
 Preprocessing on Host completed in 0 minutes!
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ____________________________________________
-previous quality: 0.271789
-new quality: 0.271789  imp = 0.000000
-PROFILE V=5 iters=1  prepare=0.0 phase1=0.0 phase2=0.0 update=0.0 count=0.0 quality=0.0 total=0.0 ms
+previous quality: 0.275688
+new quality: 0.275688  imp = 0.000000
+PROFILE V=6 iters=1  prepare=0.0 phase1=0.0 phase2=0.0 update=0.0 count=0.0 quality=0.0 total=0.0 ms
 REFINE: 0 ms
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Leiden step completed in 0 minutes!

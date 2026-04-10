@@ -463,8 +463,7 @@ __global__ void build_edge_triples_out(
 }
 
 int renumber_communities(Leiden_Partition& p, graph& g,
-                         int* tracked_labels, int n_original,
-                         const int* parent_assignment)
+                         int* tracked_labels, int n_original)
 {
     const int V_old = g.nodes;
     const int E_old = g.ed;
@@ -713,102 +712,7 @@ int renumber_communities(Leiden_Partition& p, graph& g,
     // ---------------------------------------------------------------
     // Stage I: initialise the partition for the aggregated graph and recurse.
     // ---------------------------------------------------------------
-    // Save the old p.node_comm (refined sub-community IDs) BEFORE
-    // create_partition reallocates and wipes p.node_comm. We need this
-    // mapping to compute, for each new super-node k, which parent
-    // P-community it belongs to (Phase 2.4b pre-seeding).
-    std::vector<int> old_node_comm_h;
-    if (parent_assignment != NULL) {
-        old_node_comm_h.assign(p.node_comm, p.node_comm + V_old);
-    }
-
     create_partition(g, p);
-
-    // ---------------------------------------------------------------
-    // Stage I.5: Phase 2.4b pre-seeding.
-    // Override the singleton init written by create_partition with the
-    // parent P-community of each super-node. This is the standard Leiden
-    // aggregation step (Traag et al. 2019): the next level starts from the
-    // partition where each refined sub-community is grouped back into its
-    // parent P-community, and local moving then decides whether to split.
-    // ---------------------------------------------------------------
-    if (parent_assignment != NULL) {
-        // 1) For each new super-node k, find its parent P-community.
-        //    Every old vertex v that maps to the same super-node k must
-        //    have the same parent (refinement guarantees sub-communities
-        //    are subsets of a single parent), so overwriting is safe.
-        std::vector<int> super_node_parent(K, -1);
-        for (int v = 0; v < V_old; v++) {
-            int old_id = old_node_comm_h[v];
-            int k = (int)(std::lower_bound(h_unique_comms.begin(),
-                                           h_unique_comms.end(),
-                                           old_id) - h_unique_comms.begin());
-            super_node_parent[k] = parent_assignment[v];
-        }
-
-        // 2) Densify parent IDs to [0, num_distinct_parents).
-        //    Use sort + unique + lower_bound for deterministic results.
-        std::vector<int> sorted_parents = super_node_parent;
-        std::sort(sorted_parents.begin(), sorted_parents.end());
-        sorted_parents.erase(std::unique(sorted_parents.begin(),
-                                         sorted_parents.end()),
-                             sorted_parents.end());
-
-        // 3) Overwrite singleton init with densified parent IDs.
-        //    Also reset final_comm and older_comm so they are consistent
-        //    with the new community assignment (the local-moving kernels
-        //    assume these start equal to node_comm).
-        for (int k = 0; k < K; k++) {
-            int dense = (int)(std::lower_bound(sorted_parents.begin(),
-                                               sorted_parents.end(),
-                                               super_node_parent[k]) -
-                              sorted_parents.begin());
-            p.node_comm[k] = dense;
-            p.final_comm[k] = dense;
-            p.older_comm[k] = dense;
-        }
-
-        // 4) Recompute community-indexed stats. create_partition set
-        //    tot_in[k] = in_deg[k], tot_out[k] = out_deg[k], sum_in[k] =
-        //    self_loops[k] (singleton-community assumption). Now that
-        //    several super-nodes belong to the same community, we must
-        //    aggregate these by community ID and add internal edges to
-        //    sum_in. Also recompute size[c] = number of super-nodes in c.
-        for (int c = 0; c < K; c++) {
-            p.tot_in[c]  = 0.0;
-            p.tot_out[c] = 0.0;
-            p.sum_in[c]  = 0.0;
-            p.size[c]    = 0;
-        }
-        for (int v = 0; v < K; v++) {
-            int c = p.node_comm[v];
-            p.tot_in[c]  += p.in_deg[v];
-            p.tot_out[c] += p.out_deg[v];
-            p.size[c]    += 1;
-        }
-        // sum_in[c] = self_loops + weight of internal edges.
-        //
-        // Convention: matches Leiden_CPU's incremental updates, where each
-        // undirected internal edge contributes "2w" (doubled because the
-        // weight total p.weight = sum of out-degree also counts each
-        // undirected edge twice). Since the aggregated CSR stores each
-        // undirected edge as BOTH directions in the out-list (k1->k2 weight
-        // w and k2->k1 weight w), iterating only out-edges of all vertices
-        // naturally counts each edge twice (once from each endpoint), which
-        // already gives the desired 2w. Iterating in-edges on top of that
-        // would count each edge FOUR times (2x over). So use only out-list.
-        for (int v = 0; v < K; v++) {
-            int cv = p.node_comm[v];
-            p.sum_in[cv] += p.self_loops[v];
-            for (int e = g.out_col[v]; e < g.out_col[v + 1]; e++) {
-                int u = g.child_out[e];
-                if (u == v) continue;
-                if (p.node_comm[u] == cv) {
-                    p.sum_in[cv] += g.wts_out[e];
-                }
-            }
-        }
-    }
 
     auto end_time2 = std::chrono::high_resolution_clock::now();
     auto duration2 = std::chrono::duration_cast<std::chrono::minutes>(end_time2 - start_time2);
@@ -1120,13 +1024,9 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
     // partition and recomputes p.tot_in / p.tot_out / p.sum_in accordingly.
     // Refinement typically yields more (smaller) communities than the raw
     // local-moving result, which improves downstream ARI on large graphs.
-    //
-    // Phase 2.4b: capture the parent P-community (pre-refinement) for each
-    // vertex so we can pre-seed the next level's partition after aggregation.
-    int* parent_assignment_buf = new int[V];
     {
         auto refine_t0 = std::chrono::high_resolution_clock::now();
-        refine_partition_cpu(p, g, parent_assignment_buf);
+        refine_partition_cpu(p, g);
         auto refine_t1 = std::chrono::high_resolution_clock::now();
         long refine_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                              refine_t1 - refine_t0)
@@ -1172,7 +1072,7 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
                 tracked_labels[i] = p.node_comm[tracked_labels[i]];
             }
         }
-        renumber_communities(p, g, tracked_labels, n_original, parent_assignment_buf);
+        renumber_communities(p, g, tracked_labels, n_original);
     }
     else
     {
@@ -1185,11 +1085,6 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
         }
         cout << "Leiden_GPU done and dusted :)" << endl;
     }
-
-    // Phase 2.4b: free parent-assignment buffer allocated before refinement.
-    // renumber_communities only reads from it (const int*) and its recursive
-    // Leiden_GPU invocation allocates its own buffer at its own level.
-    delete[] parent_assignment_buf;
 
     return 0;
 }
