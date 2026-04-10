@@ -214,34 +214,37 @@ for (int it = 0; it<renumber_c.size(); it++)
  auto start_time = std::chrono::high_resolution_clock::now();
  aggregate_adj adj;
 
- #pragma omp parallel for
-for(int comm=0; comm<community_range; comm++)                                                            
+// Pre-size the output so threads can write to fixed indices instead of push_back
+adj.next_graph.resize(community_range);
+
+#pragma omp parallel for
+for(int comm=0; comm<community_range; comm++)
 {
 int community=renumber_c[comm];
 const vector<int> & community_nodes = comms[community];
 unordered_map <int, double> temp;
 vector <pair <double, int> > temp_edges;
-for(int node=0; node<community_nodes.size(); node++)                                                                        
+for(int node=0; node<community_nodes.size(); node++)
 {
-for(int neighbor=g.out_col[community_nodes[node]]; neighbor<g.out_col[community_nodes[node]+1]; neighbor++)                                              
+for(int neighbor=g.out_col[community_nodes[node]]; neighbor<g.out_col[community_nodes[node]+1]; neighbor++)
 {
-    int n_neig=g.child_out[neighbor]; 
+    int n_neig=g.child_out[neighbor];
     double w_neig=g.wts_out[neighbor];
     int neig_comm= p.node_comm[n_neig];
-    temp[dummy_indexes[neig_comm]]+= w_neig;    
+    temp[dummy_indexes[neig_comm]]+= w_neig;
 }
-}    
+}
 
-for (const auto& entry : temp) 
+for (const auto& entry : temp)
 {
 temp_edges.push_back(make_pair(entry.second, entry.first));
-}      
+}
     auto myCompare= [](const pair<double, int>& a, const pair<double, int>& b) {
         return a.second < b.second;
     };
-sort(temp_edges.begin(), temp_edges.end(), myCompare);                           
-adj.next_graph.push_back(temp_edges);  
-} 
+sort(temp_edges.begin(), temp_edges.end(), myCompare);
+adj.next_graph[comm] = std::move(temp_edges);
+}
 
 int arcs=0;
 for(int i=0; i< adj.next_graph.size(); i++)
