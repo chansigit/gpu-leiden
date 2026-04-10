@@ -20,7 +20,7 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
 
-from . import _core
+from ._core import leiden_from_csr as _leiden_from_csr_raw
 
 __all__ = ["leiden_from_csr", "__version__"]
 __version__ = "0.1.0"
@@ -76,7 +76,7 @@ def leiden_from_csr(
     indices = np.ascontiguousarray(csr.indices, dtype=np.int32)
     data = np.ascontiguousarray(csr.data, dtype=np.float64)
 
-    return _core.leiden_from_csr(
+    return _leiden_from_csr_raw(
         indptr=indptr,
         indices=indices,
         data=data,

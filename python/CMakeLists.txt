@@ -52,3 +52,11 @@ target_compile_options(_core PRIVATE
 
 # Install the compiled module into the gpu_leiden package directory
 install(TARGETS _core LIBRARY DESTINATION gpu_leiden)
+
+# Ship type stubs and PEP 561 marker so type checkers (pyright/mypy) can
+# introspect the compiled extension module.
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_leiden/_core.pyi
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_leiden/py.typed
+    DESTINATION gpu_leiden
+)
