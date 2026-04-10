@@ -23,6 +23,10 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <iomanip>
+#include <random>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 using namespace std;
 
@@ -1727,6 +1731,123 @@ static void build_graph_from_csr(graph& g,
     std::memcpy(g.wts_in,    in_data,     n_in_edges  * sizeof(double));
 }
 
+// ============================================================================
+// Phase 3.2: Shake perturbation for ILS "kick" moves.
+//
+// Gumbel-per-move noise (Phase 3.1) is too weak to escape strong local
+// optima on large graphs — on pcw6 and merfish, the deterministic baseline
+// already lands in a basin that probabilistic per-move noise cannot jump
+// out of, so ILS early-stops without improvement.
+//
+// Textbook ILS instead uses coarse-grained "kick" perturbations: destroy a
+// substantial chunk of the current solution, then re-run local search from
+// there. For Leiden that translates to: pick a small number of large
+// communities and shatter them back into singletons. The subsequent
+// local-moving + refinement pass will rebuild them — and because the
+// starting point is substantially different, it can land in a different
+// (potentially better) basin.
+//
+// Implementation notes:
+//   - Runs on the host over `labels[0..n)`, O(n + num_comm log num_comm).
+//   - Label output must stay in [0, n_nodes) because create_c_partition_from_labels
+//     uses labels as indices into partition arrays of length n_nodes.
+//     We guarantee this via a two-phase scheme: mark shaken nodes with
+//     unique negative sentinels, then run a compaction pass that collapses
+//     both surviving labels and sentinels to [0, new_num_comm).
+//   - Communities are sampled from the top-`top_frac` fraction by size
+//     (default 20%) so we kick meaningful structure rather than wasting
+//     a shake on a trivial community.
+//   - k_shake distinct communities are picked uniformly from that top slice
+//     via partial Fisher-Yates.
+//
+// Returns the number of nodes that were shaken (for logging / monitoring).
+// ============================================================================
+static int shake_partition(int* labels,
+                           int n_nodes,
+                           int k_shake,
+                           double top_frac,
+                           std::mt19937& rng,
+                           bool verbose)
+{
+    if (n_nodes <= 1 || k_shake <= 0) return 0;
+
+    // 1. Count community sizes.
+    std::unordered_map<int, int> comm_size;
+    comm_size.reserve(n_nodes / 4 + 1);
+    for (int i = 0; i < n_nodes; i++) {
+        comm_size[labels[i]]++;
+    }
+    int num_comm = (int)comm_size.size();
+    if (num_comm < 2) return 0;
+
+    // 2. Sort communities by size, descending.
+    std::vector<std::pair<int, int>> sorted_comms;  // (size, comm_id)
+    sorted_comms.reserve(num_comm);
+    for (std::unordered_map<int, int>::iterator it = comm_size.begin();
+         it != comm_size.end(); ++it) {
+        sorted_comms.push_back(std::make_pair(it->second, it->first));
+    }
+    std::sort(sorted_comms.begin(), sorted_comms.end(),
+              std::greater<std::pair<int, int> >());
+
+    // 3. Determine the top-N slice.
+    int top_n = (int)(num_comm * top_frac);
+    if (top_n < 1) top_n = 1;
+    if (top_n > num_comm) top_n = num_comm;
+
+    // 4. Sample k_shake distinct indices from [0, top_n) via partial Fisher-Yates.
+    int k = std::min(k_shake, top_n);
+    std::vector<int> cand_idx(top_n);
+    for (int i = 0; i < top_n; i++) cand_idx[i] = i;
+    std::unordered_set<int> shake_set;  // community IDs to shatter
+    shake_set.reserve(k);
+    int shake_budget = 0;  // expected number of nodes to shake (for logging)
+    for (int i = 0; i < k; i++) {
+        std::uniform_int_distribution<int> dist(i, top_n - 1);
+        int j = dist(rng);
+        std::swap(cand_idx[i], cand_idx[j]);
+        int picked_comm = sorted_comms[cand_idx[i]].second;
+        shake_set.insert(picked_comm);
+        shake_budget += sorted_comms[cand_idx[i]].first;
+    }
+
+    // 5. Mark shaken nodes with unique negative sentinels.
+    int sentinel = -1;
+    int shaken_count = 0;
+    for (int i = 0; i < n_nodes; i++) {
+        if (shake_set.find(labels[i]) != shake_set.end()) {
+            labels[i] = sentinel--;
+            shaken_count++;
+        }
+    }
+
+    // 6. Compact labels to [0, new_num_comm). Every surviving label and every
+    //    sentinel gets a fresh ID in iteration order, guaranteeing uniqueness
+    //    for sentinels (= new singletons) and contiguity for the partition
+    //    init routine that follows.
+    std::unordered_map<int, int> relabel;
+    relabel.reserve(num_comm - (int)shake_set.size() + shaken_count + 1);
+    int next_new = 0;
+    for (int i = 0; i < n_nodes; i++) {
+        std::unordered_map<int, int>::iterator it = relabel.find(labels[i]);
+        if (it == relabel.end()) {
+            relabel[labels[i]] = next_new;
+            labels[i] = next_new;
+            next_new++;
+        } else {
+            labels[i] = it->second;
+        }
+    }
+
+    if (verbose) {
+        printf("shake: broke %d/%d top-%d communities, %d nodes -> singletons "
+               "(num_comm %d -> %d)\n",
+               (int)shake_set.size(), num_comm, top_n, shaken_count,
+               num_comm, next_new);
+    }
+    return shaken_count;
+}
+
 extern "C" {
 
 int leiden_from_csr(
@@ -1850,44 +1971,110 @@ int leiden_from_csr(
 
     // Precompute scalars used by the host-side Q evaluator.
     //
-    // NOTE: We evaluate UNWEIGHTED modularity here (treat every existing
-    // edge as weight 1.0), because that is exactly the metric igraph's
-    // VertexClustering.modularity and leidenalg's part.modularity report
-    // when called without an explicit weights argument. Matching that
-    // convention means the ILS restart that we pick as "best internal"
-    // is the same one the external benchmark would pick as best.
-    // Our INTERNAL phase1/refine gain formulas still use weighted math
-    // (the underlying optimization target), which is what we want; only
-    // the cross-restart scoring uses unweighted Q.
-    const double m_total = (double)n_out_edges;  // each edge counted once per direction
+    // Phase 3.2 (FIX): Evaluate the WEIGHTED modularity — the same metric
+    // leidenalg optimises and that the external benchmarks report via
+    // `g.modularity(labels, weights='weight')`. Phase 3.1 evaluated the
+    // UNWEIGHTED Q here, which turned out to let ILS "accept" restarts
+    // whose weighted Q was actually worse than the deterministic baseline
+    // on the merfish dataset — the unweighted-vs-weighted mismatch of the
+    // scorer was silently corrupting our basin selection.
+    //
+    // Convention for the symmetric-CSR directed formulation (matches the
+    // GPU kernel's modularity and igraph's undirected weighted Q):
+    //   m_total  = sum of all out-edge weights (= 2W for symmetric input)
+    //   k_out[v] = sum of out_data on v's out-edges (weighted out-degree)
+    //   k_in[v]  = sum of in_data  on v's in-edges  (weighted in-degree)
+    //   L_c (x2) = sum over (v in c, u in c, e = (v,u)) of out_data[e]
+    //   K_c      = sum_{v in c} k_out[v] == sum_{v in c} k_in[v] for symmetric
+    //   Q = (L_c_x2 - gamma * K_c * K_c / m_total) / m_total summed over c
+    //
+    // k_out / k_in depend only on the CSR data and are therefore
+    // precomputed once before the restart loop. m_total ditto.
+    double m_total = 0.0;
+    for (int e = 0; e < n_out_edges; e++) m_total += out_data[e];
     const double inv_m = (m_total > 0.0) ? (1.0 / m_total) : 0.0;
+
+    std::vector<double> k_out(n_nodes, 0.0);
+    std::vector<double> k_in(n_nodes, 0.0);
+    for (int v = 0; v < n_nodes; v++) {
+        double s = 0.0;
+        for (int e = out_indptr[v]; e < out_indptr[v + 1]; e++) s += out_data[e];
+        k_out[v] = s;
+    }
+    for (int v = 0; v < n_nodes; v++) {
+        double s = 0.0;
+        for (int e = in_indptr[v]; e < in_indptr[v + 1]; e++) s += in_data[e];
+        k_in[v] = s;
+    }
 
     // Total number of "runs" = 1 mandatory deterministic baseline + n_runs
     // probabilistic restarts. The deterministic baseline gives us a
     // floor: the quality flavor's final output is guaranteed to be
     // at least as good as running deterministic flavor alone.
     //
-    // Early termination: stop after `no_improve_limit` consecutive
-    // probabilistic restarts that fail to improve the best modularity.
-    // This keeps quality flavor fast on graphs where the determinstic
-    // path is already near-optimal and extra exploration isn't helping,
-    // while retaining the full restart budget on graphs where it is.
+    // Phase 3.2: we DROPPED the consecutive-non-improvement early stop
+    // that Phase 3.1 used. With shake-based kick perturbation (below),
+    // a run that fails to improve still leaves the search in a
+    // meaningfully different region, so the next kick starts from a
+    // different basin and can still break through. Early-stopping
+    // wastes the exploration budget that made quality flavor quality.
+    // Instead we track `no_improve` purely to adaptively *grow* the
+    // shake intensity when we plateau.
     const int total_runs = n_runs + 1;
-    const int no_improve_limit = 3;  // after 3 failed restarts in a row, stop
     int no_improve = 0;
+
+    // RNG for shake perturbation (independent of the Gumbel RNG on the
+    // GPU so their seed streams don't interact). Seeded off random_seed
+    // with a large xor constant for decorrelation.
+    std::mt19937 shake_rng(random_seed ^ 0xDEADBEEFu);
+
     for (int restart = 0; restart < total_runs; restart++) {
-        // First iteration (restart == 0) is the DETERMINISTIC BASELINE.
-        // Subsequent iterations are probabilistic with independent seeds.
-        int run_flavor = (restart == 0) ? 0 : 1;
+        // Phase 3.2c: ALL restarts now use the deterministic local search
+        // path (flavor=0). Diversity comes entirely from the shake
+        // perturbation applied to the warm-start partition — layering
+        // per-move Gumbel noise on top of an already-perturbed starting
+        // point turned out to prevent the local search from climbing
+        // cleanly to the shaken basin's optimum. Classical ILS recipe:
+        //   S' = perturbation(S)    (shake)
+        //   S'' = local_search(S')  (pure greedy, NOT stochastic)
+        //   accept if better(S'', S*)
+        // Restart 0 = baseline (no shake); restarts 1..N = kick + refine.
+        int run_flavor = 0;
         // Decorrelate restart seeds with a large odd prime (golden ratio
-        // hash constant) so that consecutive restart indices give very
-        // different RNG streams.
+        // hash constant). With flavor=0 the seed is unused by Leiden_GPU
+        // itself, but we still reseed the shake RNG per restart (below)
+        // via `this_seed` indirectly through the shake call sequence.
         unsigned int this_seed =
             random_seed + (unsigned int)(restart * 2654435761u);
 
         // current_labels across the n_iters outer loop for this restart.
+        // Phase 3.2: probabilistic restarts WARM-START from the current
+        // best partition and then SHAKE (shatter k large communities
+        // into singletons). This implements the classical ILS "kick":
+        // destroy a substantial chunk of the current solution, then
+        // re-run local search from there. Without a kick, probabilistic
+        // Leiden restarts converge back to the same basin — which is
+        // exactly what we saw on pcw6 and merfish under Phase 3.1.
         int* current_labels = new int[n_nodes];
-        for (int i = 0; i < n_nodes; i++) current_labels[i] = i;
+        int shaken_nodes = 0;
+        if (restart == 0) {
+            // Deterministic baseline: pure singletons (unchanged from v0.2).
+            for (int i = 0; i < n_nodes; i++) current_labels[i] = i;
+        } else {
+            // Warm-start from best so far.
+            std::memcpy(current_labels, best_labels, n_nodes * sizeof(int));
+            // Adaptive shake intensity: start gentle (k=1), grow with
+            // consecutive non-improving restarts so we kick harder when
+            // the current basin is sticky. Caps implicitly at top_n
+            // inside shake_partition.
+            int k_shake = 1 + (no_improve / 2);  // 1,1,2,2,3,3,...
+            shaken_nodes = shake_partition(
+                current_labels, n_nodes,
+                /*k_shake=*/k_shake,
+                /*top_frac=*/0.20,
+                shake_rng,
+                /*verbose=*/true);
+        }
 
         for (int iter = 0; iter < n_iters; iter++) {
             graph g;
@@ -1898,7 +2085,11 @@ int leiden_from_csr(
 
             Leiden_Partition p;
             p.resolution = resolution;
-            if (iter == 0) {
+            // Phase 3.2: at iter 0 of a probabilistic restart, current_labels
+            // already holds the shaken warm-start partition, so feed it
+            // directly to the C partition builder. For the deterministic
+            // baseline (restart 0) we keep the pure singleton path.
+            if (restart == 0 && iter == 0) {
                 create_c_partition(g, p);
             } else {
                 create_c_partition_from_labels(g, p, current_labels);
@@ -1908,7 +2099,7 @@ int leiden_from_csr(
                 std::vector<int> tmp(p.node_comm, p.node_comm + n_nodes);
                 std::sort(tmp.begin(), tmp.end());
                 tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
-                const char* kind = (run_flavor == 0) ? "DET" : "PROB";
+                const char* kind = (restart == 0) ? "DET" : "KICK";
                 printf("leiden_from_csr: %s run %d/%d iter %d/%d seed=%u starting with %zu distinct communities\n",
                        kind, restart, n_runs, iter + 1, n_iters, this_seed, tmp.size());
             }
@@ -1929,28 +2120,25 @@ int leiden_from_csr(
             free_part(p);
         }
 
-        // Compute canonical UNWEIGHTED modularity from current_labels
-        // directly on the original CSR structure (every edge counted as
-        // weight 1.0). See the comment at m_total above for rationale.
+        // Phase 3.2: Compute WEIGHTED modularity from current_labels
+        // on the original CSR structure. This matches leidenalg's
+        // internal optimisation target AND the external benchmarks'
+        // reporting convention (`g.modularity(labels, weights='weight')`).
         //
-        //   Q = (1/m) * { sum_c internal(c) - res * sum_c tot_out(c) * tot_in(c) / m }
+        //   Q = (1/m_total) * sum_c { internal_w(c) - res * K_c_out * K_c_in / m_total }
         //
-        // where internal(c) = count of (v,u) arcs with both endpoints in c,
-        //       tot_out(c)  = out-arity (unweighted degree) of nodes in c,
-        //       tot_in(c)   = in-arity  of nodes in c.
+        // where internal_w(c) = sum over directed arcs (v,u) with both
+        //                       endpoints in c of out_data[(v,u)],
+        //       K_c_out       = sum_{v in c} weighted out-degree,
+        //       K_c_in        = sum_{v in c} weighted in-degree.
         //
-        // For symmetric undirected input, tot_in == tot_out per node.
+        // For a symmetric undirected CSR each undirected edge contributes
+        // its weight twice to internal_w (once in each direction), and
+        // m_total == 2W. The formula simplifies to the standard
+        // undirected weighted modularity after that factor cancels.
         double run_modularity = -1e300;
         if (m_total > 0.0) {
-            // Node unweighted degrees (number of incident arcs)
-            std::vector<double> k_out(n_nodes, 0.0);
-            std::vector<double> k_in(n_nodes, 0.0);
-            for (int v = 0; v < n_nodes; v++) {
-                k_out[v] = (double)(out_indptr[v + 1] - out_indptr[v]);
-                k_in[v]  = (double)(in_indptr[v + 1]  - in_indptr[v]);
-            }
-
-            // Community totals
+            // Community totals (weighted)
             std::unordered_map<int, double> tot_out_c;
             std::unordered_map<int, double> tot_in_c;
             std::unordered_map<int, double> internal_c;
@@ -1959,13 +2147,13 @@ int leiden_from_csr(
                 tot_out_c[c] += k_out[v];
                 tot_in_c[c]  += k_in[v];
             }
-            // Internal edges: iterate all (u, v) via out-CSR
+            // Internal edge weight sum: iterate all directed arcs via out-CSR
             for (int v = 0; v < n_nodes; v++) {
                 int cv = current_labels[v];
                 for (int e = out_indptr[v]; e < out_indptr[v + 1]; e++) {
                     int u = out_indices[e];
                     if (current_labels[u] == cv) {
-                        internal_c[cv] += 1.0;  // unweighted
+                        internal_c[cv] += out_data[e];  // WEIGHTED
                     }
                 }
             }
@@ -1989,9 +2177,13 @@ int leiden_from_csr(
         // higher Q" failure mode while still picking up real
         // improvements from probabilistic exploration.
         //
+        // Phase 3.2: lowered from 1e-3 to 1e-4. Shake perturbation gives
+        // the search genuine basin-hopping capability, so tighter
+        // improvements are now meaningful signals rather than noise.
+        //
         // The deterministic baseline (first run) always unconditionally
         // sets the initial best — it sees best_modularity == -1e300.
-        const double improve_threshold = 1e-3;
+        const double improve_threshold = 1e-4;
         bool improved;
         if (run_flavor == 0) {
             improved = (run_modularity > best_modularity);
@@ -2002,24 +2194,32 @@ int leiden_from_csr(
         if (improved) {
             best_modularity = run_modularity;
             std::memcpy(best_labels, current_labels, n_nodes * sizeof(int));
+            // Reset shake intensity when we land a real improvement:
+            // the new basin is fresh, start kicking gently again.
             no_improve = 0;
-        } else if (run_flavor == 1) {
+        } else if (restart > 0) {
+            // Grow shake intensity for the next kick restart.
             no_improve++;
         }
 
-        const char* kind_final = (run_flavor == 0) ? "DET  " : "PROB ";
-        printf("ILS %s run %d/%d: modularity = %.6f (best so far: %.6f)%s\n",
-               kind_final, restart, n_runs, run_modularity, best_modularity,
-               improved ? " [accepted]" : "");
+        const char* kind_final = (restart == 0) ? "DET  " : "KICK ";
+        if (restart > 0 && shaken_nodes > 0) {
+            printf("ILS %s run %d/%d: modularity = %.6f (best so far: %.6f)%s  "
+                   "[shaken=%d, k=%d]\n",
+                   kind_final, restart, n_runs, run_modularity, best_modularity,
+                   improved ? " [accepted]" : "",
+                   shaken_nodes, 1 + ((no_improve - (improved ? 0 : 1)) / 2));
+        } else {
+            printf("ILS %s run %d/%d: modularity = %.6f (best so far: %.6f)%s\n",
+                   kind_final, restart, n_runs, run_modularity, best_modularity,
+                   improved ? " [accepted]" : "");
+        }
 
         delete[] current_labels;
 
-        // Early termination: bail out if we've had several consecutive
-        // probabilistic runs with no meaningful improvement.
-        if (no_improve >= no_improve_limit) {
-            printf("ILS early stop: %d consecutive non-improving runs\n", no_improve);
-            break;
-        }
+        // Phase 3.2: no more early-stop. Full restart budget always runs
+        // so that progressively harder kicks get a chance to break
+        // through on graphs where the deterministic baseline is sticky.
     }
 
     std::memcpy(out_labels, best_labels, n_nodes * sizeof(int));
