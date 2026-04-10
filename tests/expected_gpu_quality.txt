@@ -1,0 +1,18 @@
+previous quality: -0.009916
+new quality: 0.107430  imp = 0.117346
+new quality: 0.171015  imp = 0.063584
+new quality: 0.214537  imp = 0.043522
+new quality: 0.229117  imp = 0.014580
+new quality: 0.231075  imp = 0.001958
+Leiden step completed in 0 minutes!
+previous quality: 0.231075
+new quality: 0.252848  imp = 0.021774
+new quality: 0.257844  imp = 0.004996
+Leiden step completed in 0 minutes!
+previous quality: 0.257844
+new quality: 0.259490  imp = 0.001646
+Leiden step completed in 0 minutes!
+previous quality: 0.259490
+new quality: 0.259490  imp = 0.000000
+Leiden step completed in 0 minutes!
+Leiden_GPU done and dusted :)

@@ -1,0 +1,39 @@
+Resolution: 1
+Time taken for reading first graph is 0 minutes!
+old quality: -0.00991574
+new quality: 0.179422  imp  = 0.189338
+new quality: 0.202493  imp  = 0.0230703
+new quality: 0.21203  imp  = 0.00953707
+new quality: 0.217146  imp  = 0.00511614
+new quality: 0.219794  imp  = 0.0026481
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Leiden step completed in 0.000000 sec 
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+range is: 28
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Aggreagte step on Host completed in 0 minutes!
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+____________________________________________
+old quality: 0.219794
+new quality: 0.270426  imp  = 0.050632
+new quality: 0.277296  imp  = 0.006871
+new quality: 0.277760  imp  = 0.000464
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Leiden step completed in 0.000000 sec 
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+range is: 9
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Aggreagte step on Host completed in 0 minutes!
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+____________________________________________
+old quality: 0.277760
+new quality: 0.277760  imp  = 0.000000
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Leiden step completed in 0.000000 sec 
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Leiden done and dusted :)
