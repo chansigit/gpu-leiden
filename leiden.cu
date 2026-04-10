@@ -1003,7 +1003,7 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
         imp = quality - prev_quality;
         printf("new quality: %.6f  imp = %.6f\n", quality, imp);
 
-    } while (moves > 0 && imp > 0.005);
+    } while (moves > 0 && imp > 1e-5);
 
     printf("PROFILE V=%d iters=%d  prepare=%.1f phase1=%.1f phase2=%.1f update=%.1f count=%.1f quality=%.1f total=%.1f ms\n",
            V, n_iters, ms_prepare, ms_phase1, ms_phase2, ms_update, ms_count, ms_quality,
@@ -1062,7 +1062,20 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
     cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
     cout << "____________________________________________" << endl;
 
-    if (quality > q_prev_it)
+    // Termination check: if refinement produced a partition in which
+    // every node is in its own community (i.e., number of distinct
+    // communities equals V), further aggregation would produce a graph
+    // of the same size and we would be stuck in a fixed point. Count
+    // the distinct community IDs in p.node_comm.
+    int n_distinct_refined;
+    {
+        std::vector<int> tmp(p.node_comm, p.node_comm + V);
+        std::sort(tmp.begin(), tmp.end());
+        tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
+        n_distinct_refined = (int)tmp.size();
+    }
+
+    if (quality > q_prev_it && n_distinct_refined < V)
     {
         // Compose tracked_labels with p.node_comm BEFORE aggregation
         // tracked_labels[i] currently = super-node ID at this level for cell i

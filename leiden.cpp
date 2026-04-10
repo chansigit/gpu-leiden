@@ -532,11 +532,20 @@ void free_part(Leiden_Partition& p)
 /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
 // Leiden refinement (CPU, OpenMP over parent communities).
 //
+// Implements Algorithm 3 (MergeNodesSubset) from Traag, Waltman, van Eck
+// 2019, "From Louvain to Leiden: guaranteeing well-connected communities".
+//
 // Replaces p.node_comm (currently the local-moving partition P) with the
 // refined partition P_refined. Each parent community c in P is refined
 // independently by starting its members as singletons and running a
-// constrained greedy local move (candidate sub-communities restricted to
-// nodes whose parent community is c).
+// constrained greedy sweep:
+//
+//   1) Only vertices that are WELL-CONNECTED to the rest of their parent
+//      community (set R in the paper) are considered for moving.
+//   2) Only vertices that are still in a SINGLETON subcommunity are moved
+//      (to avoid cascading moves within a parent community).
+//   3) Only target subcommunities that are themselves WELL-CONNECTED to
+//      the rest of the parent community (set T) are valid merge targets.
 //
 // After refinement, p.tot_in, p.tot_out, and p.sum_in are recomputed for
 // the refined partition using the same convention as Leiden_CPU:
@@ -582,27 +591,90 @@ void refine_partition_cpu(Leiden_Partition& p, graph& g)
         const std::vector<int>& verts = by_orig[c];
         if (verts.size() <= 1) continue;  // singleton parent — nothing to refine
 
+        // -----------------------------------------------------------------
+        // Precompute parent-community level degree totals (k_S_in, k_S_out)
+        // -----------------------------------------------------------------
+        double k_S_in = 0.0, k_S_out = 0.0;
+        for (size_t k = 0; k < verts.size(); k++) {
+            int v = verts[k];
+            k_S_in  += p.in_deg[v];
+            k_S_out += p.out_deg[v];
+        }
+
+        // -----------------------------------------------------------------
+        // Per-node edge weight from v to the rest of the parent community S
+        // (excluding self-loops). Uses the same directed convention as the
+        // gain formula: out-edges to S plus in-edges from S, summed.
+        // -----------------------------------------------------------------
+        std::vector<double> E_v_S(verts.size(), 0.0);
+        for (size_t k = 0; k < verts.size(); k++) {
+            int v = verts[k];
+            double e = 0.0;
+            for (int ei = g.out_col[v]; ei < g.out_col[v + 1]; ei++) {
+                int u = g.child_out[ei];
+                if (u == v) continue;
+                if (orig_comm[u] == c) e += g.wts_out[ei];
+            }
+            for (int ei = g.in_col[v]; ei < g.in_col[v + 1]; ei++) {
+                int u = g.child_in[ei];
+                if (u == v) continue;
+                if (orig_comm[u] == c) e += g.wts_in[ei];
+            }
+            E_v_S[k] = e;
+        }
+
+        // -----------------------------------------------------------------
+        // Well-connectedness of nodes (set R). A node v is well-connected
+        // iff its edge weight to S\{v} exceeds the null-model expectation,
+        // using the SAME formula as the gain calculation used elsewhere.
+        // -----------------------------------------------------------------
+        std::vector<char> in_R(verts.size(), 0);
+        for (size_t k = 0; k < verts.size(); k++) {
+            int v = verts[k];
+            double dv_in  = p.in_deg[v];
+            double dv_out = p.out_deg[v];
+            double expected = res * (dv_in  * (k_S_out - dv_out)
+                                   + dv_out * (k_S_in  - dv_in )) / w;
+            in_R[k] = (E_v_S[k] >= expected) ? 1 : 0;
+        }
+
         // Local sub-community degree stats, keyed by sub-community id (node id).
         // std::map for deterministic iteration order.
         std::map<int, double> sub_tot_in;
         std::map<int, double> sub_tot_out;
         std::map<int, double> sub_sum_in;
+        // sub_size: number of nodes currently in each subcommunity. Used for
+        // the singleton-only move filter (Change 2).
+        std::map<int, int>    sub_size;
+        // sub_E_in_S: edge weight between the sub and S\sub. Used for the
+        // target well-connectedness filter (Change 3).
+        std::map<int, double> sub_E_in_S;
 
         for (size_t k = 0; k < verts.size(); k++) {
             int v = verts[k];
-            sub_tot_in[v]  = p.in_deg[v];
-            sub_tot_out[v] = p.out_deg[v];
-            sub_sum_in[v]  = p.self_loops[v];
+            sub_tot_in[v]   = p.in_deg[v];
+            sub_tot_out[v]  = p.out_deg[v];
+            sub_sum_in[v]   = p.self_loops[v];
+            sub_size[v]     = 1;
+            sub_E_in_S[v]   = E_v_S[k];
         }
 
         double inv_w  = 1.0 / w;
         double inv_w2 = inv_w * inv_w;
 
-        // Greedy sweep: each vertex tries to join the best sub-community
+        // Greedy sweep: each well-connected vertex that is still a
+        // singleton tries to join the best well-connected sub-community
         // composed of neighbors whose PARENT community is still c.
         for (size_t k = 0; k < verts.size(); k++) {
+            // Change 1: skip nodes that are not well-connected (not in R).
+            if (!in_R[k]) continue;
+
             int v = verts[k];
             int my_sub = p.node_comm[v];
+
+            // Change 2: skip vertices that are no longer in a singleton
+            // subcommunity. Once v has merged, it stays put.
+            if (sub_size[my_sub] != 1) continue;
 
             // Accumulate weight from v to each candidate sub (use std::map
             // for deterministic iteration order).
@@ -624,7 +696,8 @@ void refine_partition_cpu(Leiden_Partition& p, graph& g)
             double dv_out = p.out_deg[v];
             double sl_v   = p.self_loops[v];
 
-            // Remove v from its current sub (bookkeeping mirrors Leiden_CPU).
+            // Remove v from its current (singleton) sub. Because my_sub
+            // is a singleton, dnc_self is always 0 (no neighbor in my_sub).
             double dnc_self = 0.0;
             std::map<int, double>::iterator it_self = dnc.find(my_sub);
             if (it_self != dnc.end()) dnc_self = it_self->second;
@@ -633,24 +706,33 @@ void refine_partition_cpu(Leiden_Partition& p, graph& g)
             sub_tot_out[my_sub] -= dv_out;
             sub_sum_in[my_sub]  -= dnc_self + sl_v;
 
-            // Find best candidate sub-community.
+            // Find best candidate sub-community, filtering to those
+            // that are well-connected to the rest of S (set T).
             int best_sub = my_sub;
             double best_gain = 0.0;
             for (std::map<int, double>::iterator it = dnc.begin();
                  it != dnc.end(); ++it) {
                 int sub = it->first;
                 double dncomm = it->second;
-                double toc_in  = sub_tot_in[sub];
-                double toc_out = sub_tot_out[sub];
+                double t_in  = sub_tot_in[sub];
+                double t_out = sub_tot_out[sub];
+
+                // Change 3: filter candidate sub by well-connectedness.
+                double sub_E = sub_E_in_S[sub];
+                double sub_expected = res * (t_in  * (k_S_out - t_out)
+                                           + t_out * (k_S_in  - t_in )) / w;
+                if (sub_E < sub_expected) continue;
+
                 double gain = (dncomm + sl_v) * inv_w
-                            - res * (toc_in * dv_out + toc_out * dv_in) * inv_w2;
+                            - res * (t_in * dv_out + t_out * dv_in) * inv_w2;
                 if (gain > best_gain) {
                     best_gain = gain;
                     best_sub = sub;
                 }
             }
 
-            // Re-insert v into best_sub (may equal my_sub).
+            // Re-insert v into best_sub (may equal my_sub). Update all
+            // running sub bookkeeping including sub_size and sub_E_in_S.
             double best_dnc = 0.0;
             std::map<int, double>::iterator it_best = dnc.find(best_sub);
             if (it_best != dnc.end()) best_dnc = it_best->second;
@@ -659,7 +741,18 @@ void refine_partition_cpu(Leiden_Partition& p, graph& g)
             sub_tot_out[best_sub] += dv_out;
             sub_sum_in[best_sub]  += best_dnc + sl_v;
 
-            p.node_comm[v] = best_sub;
+            if (best_sub == my_sub) {
+                // No real move; sub_size/sub_E_in_S unchanged.
+            } else {
+                sub_size[my_sub]   = 0;  // leave at 0; never re-entered
+                sub_size[best_sub] += 1;
+
+                // Net update of sub_E_in_S: += E_v_S[k] - 2*best_dnc.
+                sub_E_in_S[best_sub] += E_v_S[k] - 2.0 * best_dnc;
+                sub_E_in_S[my_sub] = 0.0;
+
+                p.node_comm[v] = best_sub;
+            }
         }
     }
 

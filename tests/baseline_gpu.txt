@@ -8,7 +8,12 @@ new quality: 0.220127  imp = 0.050929
 new quality: 0.232490  imp = 0.012363
 new quality: 0.240932  imp = 0.008442
 new quality: 0.241202  imp = 0.000270
-PROFILE V=100 iters=7  prepare=0.0 phase1=0.1 phase2=0.0 update=0.1 count=0.1 quality=0.1 total=0.5 ms
+new quality: 0.242642  imp = 0.001439
+new quality: 0.243892  imp = 0.001250
+new quality: 0.245110  imp = 0.001218
+new quality: 0.245368  imp = 0.000258
+new quality: 0.245368  imp = 0.000000
+PROFILE V=100 iters=12  prepare=0.1 phase1=0.1 phase2=0.0 update=0.2 count=0.1 quality=0.2 total=0.7 ms
 REFINE: 0 ms
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Leiden step completed in 0 minutes!
@@ -22,14 +27,16 @@ ____________________________________________
 Preprocessing on Host completed in 0 minutes!
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ____________________________________________
-previous quality: 0.167288
-new quality: 0.196621  imp = 0.029333
-new quality: 0.237237  imp = 0.040616
-new quality: 0.252535  imp = 0.015297
-new quality: 0.262301  imp = 0.009766
-new quality: 0.270388  imp = 0.008087
-new quality: 0.271120  imp = 0.000732
-PROFILE V=41 iters=6  prepare=0.0 phase1=0.1 phase2=0.0 update=0.2 count=0.1 quality=0.1 total=0.4 ms
+previous quality: 0.162571
+new quality: 0.203801  imp = 0.041231
+new quality: 0.235918  imp = 0.032117
+new quality: 0.255688  imp = 0.019770
+new quality: 0.257098  imp = 0.001410
+new quality: 0.267396  imp = 0.010298
+new quality: 0.268787  imp = 0.001391
+new quality: 0.269540  imp = 0.000753
+new quality: 0.269540  imp = 0.000000
+PROFILE V=40 iters=8  prepare=0.0 phase1=0.1 phase2=0.0 update=0.2 count=0.1 quality=0.1 total=0.6 ms
 REFINE: 0 ms
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Leiden step completed in 0 minutes!
@@ -43,11 +50,10 @@ ____________________________________________
 Preprocessing on Host completed in 0 minutes!
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ____________________________________________
-previous quality: 0.247705
-new quality: 0.254842  imp = 0.007137
-new quality: 0.264840  imp = 0.009997
-new quality: 0.264840  imp = 0.000000
-PROFILE V=16 iters=3  prepare=0.0 phase1=0.0 phase2=0.0 update=0.1 count=0.0 quality=0.1 total=0.2 ms
+previous quality: 0.251512
+new quality: 0.262194  imp = 0.010683
+new quality: 0.262194  imp = 0.000000
+PROFILE V=12 iters=2  prepare=0.0 phase1=0.0 phase2=0.0 update=0.0 count=0.0 quality=0.0 total=0.1 ms
 REFINE: 0 ms
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Leiden step completed in 0 minutes!
@@ -61,25 +67,10 @@ ____________________________________________
 Preprocessing on Host completed in 0 minutes!
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ____________________________________________
-previous quality: 0.274010
-new quality: 0.275688  imp = 0.001678
-PROFILE V=8 iters=1  prepare=0.0 phase1=0.0 phase2=0.0 update=0.0 count=0.0 quality=0.0 total=0.1 ms
-REFINE: 0 ms
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Leiden step completed in 0 minutes!
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-____________________________________________
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Aggregate step on Device completed in 0 minutes!
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-____________________________________________
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Preprocessing on Host completed in 0 minutes!
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-____________________________________________
-previous quality: 0.275688
-new quality: 0.275688  imp = 0.000000
-PROFILE V=6 iters=1  prepare=0.0 phase1=0.0 phase2=0.0 update=0.0 count=0.0 quality=0.0 total=0.0 ms
+previous quality: 0.263798
+new quality: 0.265631  imp = 0.001834
+new quality: 0.265631  imp = 0.000000
+PROFILE V=9 iters=2  prepare=0.0 phase1=0.0 phase2=0.0 update=0.0 count=0.0 quality=0.0 total=0.1 ms
 REFINE: 0 ms
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Leiden step completed in 0 minutes!
