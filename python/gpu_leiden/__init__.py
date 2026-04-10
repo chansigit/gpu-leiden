@@ -20,7 +20,7 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
 
-from ._core import leiden_from_csr as _leiden_from_csr_raw
+from ._core import leiden_from_csr as _leiden_from_csr_raw  # type: ignore[import-not-found]
 
 __all__ = ["leiden_from_csr", "__version__"]
 __version__ = "0.1.0"
