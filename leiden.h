@@ -40,7 +40,7 @@ Leiden_Partition create_partition(graph& g, Leiden_Partition& p);
 int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
                int* tracked_labels, int n_original);
 double find_quality_cpu(Leiden_Partition& p, graph& g);
-void refine_partition_cpu(Leiden_Partition& p, graph& g);
+void refine_partition_cpu(Leiden_Partition& p, graph& g, int* parent_assignment_out);
 double ToOwnCommunity(int node, int community, double bestGain, int old_comm, Leiden_Partition& d_p, graph& d_g);
 double computGain(int node, int community, Leiden_Partition& d_p, graph& d_g);
 double find_to_own(Leiden_Partition& d_p, graph& d_g, double dncomm, int i, int community, int comm);

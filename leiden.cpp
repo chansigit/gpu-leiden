@@ -544,7 +544,7 @@ void free_part(Leiden_Partition& p)
 //   edge with both endpoints in c, counts it once from out-edges and once
 //   from in-edges (i.e., the internal weight is effectively doubled for
 //   directed-pair edges, matching the existing code).
-void refine_partition_cpu(Leiden_Partition& p, graph& g)
+void refine_partition_cpu(Leiden_Partition& p, graph& g, int* parent_assignment_out)
 {
     int V = g.nodes;
     double w = p.weight;
@@ -553,6 +553,12 @@ void refine_partition_cpu(Leiden_Partition& p, graph& g)
     // 1) save parent partition P
     std::vector<int> orig_comm(V);
     for (int i = 0; i < V; i++) orig_comm[i] = p.node_comm[i];
+
+    // Export parent partition so the caller can use it to pre-seed the
+    // next-level partition after aggregation (Phase 2.4b).
+    if (parent_assignment_out != NULL) {
+        for (int i = 0; i < V; i++) parent_assignment_out[i] = orig_comm[i];
+    }
 
     // 2) reset to singletons
     for (int i = 0; i < V; i++) p.node_comm[i] = i;
