@@ -180,147 +180,150 @@ __global__ void prepare_iteration_kernel(
     }
 }
 
-// Phase 1: For each node, compute the best candidate community and write
-// final_comm[i] ONCE at the very end. All cross-thread memory dependencies
-// are read-only within this kernel (node_comm, older_comm, tot_in, tot_out,
-// in_deg, out_deg, self_loops, edge arrays, resolution, weight, nbrs, pos).
+// Phase 1 (warp-cooperative): one warp per node, edges parallelized across lanes.
 //
-// Optimisation: single-pass edge accumulation. The OLD find_community called
-// find_to_own once per candidate community, scanning ALL edges each time
-// (O(degree * candidates)). This version scans edges ONCE and dispatches
-// each edge to the matching candidate slot via a linear scan over a small
-// local array (O(degree + candidates*avg_search)).
-__global__ void find_community_phase1(Leiden_Partition d_p, graph d_g)
+// Each warp uses a slice of shared memory holding (cand_comm[MAX_LOCAL_CANDS],
+// cand_weight[MAX_LOCAL_CANDS]) for its node. With block size 512 (16 warps),
+// per-block shared memory = 16 * (128*4 + 128*8) = 24 KB, well within the
+// 100 KB/SM limit on sm_80.
+//
+// For nodes with num_cands > MAX_LOCAL_CANDS the warp processes candidates
+// in chunks of MAX_LOCAL_CANDS: for each chunk, (a) load the chunk's cand
+// IDs, (b) scan all edges and accumulate weights into the current chunk's
+// slots, (c) compute gains and update the warp-wide best. Cost per node is
+// O(ceil(num_cands / MAX_LOCAL_CANDS) * degree), distributed over 32 lanes.
+#define PHASE1_WARP_MAX_CANDS 128
+
+__global__ void find_community_phase1_warp(Leiden_Partition d_p, graph d_g)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    extern __shared__ unsigned char smem[];
+    const int WARP_SIZE = 32;
+    const int MAX_LOCAL_CANDS = PHASE1_WARP_MAX_CANDS;
+
+    int warps_per_block = blockDim.x / WARP_SIZE;
+    int warp_id_in_block = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int warp_id_global = blockIdx.x * warps_per_block + warp_id_in_block;
+    int i = warp_id_global;  // one warp per node
+
     if (i >= d_g.nodes) return;
 
-    int old_comm = d_p.node_comm[i];   // equals older_comm[i] after prepare kernel
+    // Per-warp shared memory slice: [int cand_comm[N]][double cand_weight[N]]
+    const int slice_bytes = MAX_LOCAL_CANDS * sizeof(int) + MAX_LOCAL_CANDS * sizeof(double);
+    int* sh_cand_comm   = (int*)(smem + warp_id_in_block * slice_bytes);
+    double* sh_cand_weight = (double*)(sh_cand_comm + MAX_LOCAL_CANDS);
+
+    int old_comm = d_p.node_comm[i];
     int cand_start = d_p.pos[i];
     int cand_end   = d_p.pos[i + 1];
     int num_cands  = cand_end - cand_start;
 
     if (num_cands <= 0) {
-        d_p.final_comm[i] = old_comm;
+        if (lane == 0) d_p.final_comm[i] = old_comm;
         return;
     }
 
-    double inv_weight  = 1.0 / d_p.weight;
-    double inv_weight2 = inv_weight * inv_weight;
+    double inv_w  = 1.0 / d_p.weight;
+    double inv_w2 = inv_w * inv_w;
+    double self_i = d_p.self_loops[i];
+    double in_i   = d_p.in_deg[i];
+    double out_i  = d_p.out_deg[i];
+    double res    = d_p.resolution;
 
-    int best_comm = old_comm;
+    int e_out_start = d_g.out_col[i];
+    int e_out_end   = d_g.out_col[i + 1];
+    int e_in_start  = d_g.in_col[i];
+    int e_in_end    = d_g.in_col[i + 1];
+
+    // Warp-wide best over all chunks
     double bestGain = 0.0;
+    int    best_comm = old_comm;
 
-    const int MAX_LOCAL_CANDS = 32;
+    // Process candidates in chunks of up to MAX_LOCAL_CANDS
+    for (int chunk_start = 0; chunk_start < num_cands; chunk_start += MAX_LOCAL_CANDS) {
+        int chunk_end = chunk_start + MAX_LOCAL_CANDS;
+        if (chunk_end > num_cands) chunk_end = num_cands;
+        int chunk_size = chunk_end - chunk_start;
 
-    if (num_cands <= MAX_LOCAL_CANDS) {
-        // --- Fast path: single-pass edge accumulation via local arrays ---
-        int cand_comm[MAX_LOCAL_CANDS];
-        double cand_weight[MAX_LOCAL_CANDS];
-
-        // Load candidate community IDs (uses older_comm, same as the
-        // original find_community behaviour).
-        for (int c = 0; c < num_cands; c++) {
-            cand_comm[c]   = d_p.older_comm[d_p.nbrs[cand_start + c]];
-            cand_weight[c] = 0.0;
+        // Load this chunk's candidate community IDs and zero its weights
+        for (int c = lane; c < chunk_size; c += WARP_SIZE) {
+            sh_cand_comm[c]   = d_p.older_comm[d_p.nbrs[cand_start + chunk_start + c]];
+            sh_cand_weight[c] = 0.0;
         }
+        __syncwarp();
 
-        // Single pass over outgoing edges
-        for (int e = d_g.out_col[i]; e < d_g.out_col[i + 1]; e++) {
+        // Outgoing edges, stride-32 across the warp
+        for (int e = e_out_start + lane; e < e_out_end; e += WARP_SIZE) {
             int target = d_g.child_out[e];
             if (target == i) continue;
             int target_comm = d_p.node_comm[target];
             double w = d_g.wts_out[e];
-            for (int c = 0; c < num_cands; c++) {
-                if (cand_comm[c] == target_comm) {
-                    cand_weight[c] += w;
+            for (int c = 0; c < chunk_size; c++) {
+                if (sh_cand_comm[c] == target_comm) {
+                    atomicAdd(&sh_cand_weight[c], w);
                     break;
                 }
             }
         }
 
-        // Single pass over incoming edges
-        for (int e = d_g.in_col[i]; e < d_g.in_col[i + 1]; e++) {
+        // Incoming edges
+        for (int e = e_in_start + lane; e < e_in_end; e += WARP_SIZE) {
             int target = d_g.child_in[e];
             if (target == i) continue;
             int target_comm = d_p.node_comm[target];
             double w = d_g.wts_in[e];
-            for (int c = 0; c < num_cands; c++) {
-                if (cand_comm[c] == target_comm) {
-                    cand_weight[c] += w;
+            for (int c = 0; c < chunk_size; c++) {
+                if (sh_cand_comm[c] == target_comm) {
+                    atomicAdd(&sh_cand_weight[c], w);
                     break;
                 }
             }
         }
+        __syncwarp();
 
-        // Find best community from accumulated weights
-        for (int c = 0; c < num_cands; c++) {
-            int comm     = cand_comm[c];
-            double dncomm = cand_weight[c];
+        // Compute per-chunk gains and update per-lane best
+        for (int c = lane; c < chunk_size; c += WARP_SIZE) {
+            int comm = sh_cand_comm[c];
+            double dncomm = sh_cand_weight[c];
 
             double toc_in, toc_out;
             if (old_comm == comm) {
-                toc_in  = d_p.tot_in[comm]  - d_p.in_deg[i];
-                toc_out = d_p.tot_out[comm] - d_p.out_deg[i];
+                toc_in  = d_p.tot_in[comm]  - in_i;
+                toc_out = d_p.tot_out[comm] - out_i;
             } else {
                 toc_in  = d_p.tot_in[comm];
                 toc_out = d_p.tot_out[comm];
             }
 
-            double newGain = (dncomm + d_p.self_loops[i]) * inv_weight
-                           - d_p.resolution * (toc_in * d_p.out_deg[i] + toc_out * d_p.in_deg[i]) * inv_weight2;
+            double gain = (dncomm + self_i) * inv_w
+                        - res * (toc_in * out_i + toc_out * in_i) * inv_w2;
 
-            if (newGain > bestGain) {
-                bestGain = newGain;
+            if (gain > bestGain) {
+                bestGain = gain;
                 best_comm = comm;
             }
         }
+        __syncwarp();
+    }
 
-    } else {
-        // --- Fallback: multi-pass for very high-degree candidate lists ---
-        // Still race-free (final_comm is not written until end of kernel).
-        for (int community = cand_start; community < cand_end; community++) {
-            int comm = d_p.older_comm[d_p.nbrs[community]];
-            double dncomm = 0.0;
-
-            // Inlined find_to_own (same match semantics as the original:
-            // node_comm[target] for current-pass matches)
-            for (int e = d_g.out_col[i]; e < d_g.out_col[i + 1]; e++) {
-                int target = d_g.child_out[e];
-                if (target != i && d_p.node_comm[target] == comm) {
-                    dncomm += d_g.wts_out[e];
-                }
-            }
-            for (int e = d_g.in_col[i]; e < d_g.in_col[i + 1]; e++) {
-                int target = d_g.child_in[e];
-                if (target != i && d_p.node_comm[target] == comm) {
-                    dncomm += d_g.wts_in[e];
-                }
-            }
-
-            double toc_in, toc_out;
-            if (old_comm == comm) {
-                toc_in  = d_p.tot_in[comm]  - d_p.in_deg[i];
-                toc_out = d_p.tot_out[comm] - d_p.out_deg[i];
-            } else {
-                toc_in  = d_p.tot_in[comm];
-                toc_out = d_p.tot_out[comm];
-            }
-
-            double newGain = (dncomm + d_p.self_loops[i]) * inv_weight
-                           - d_p.resolution * (toc_in * d_p.out_deg[i] + toc_out * d_p.in_deg[i]) * inv_weight2;
-
-            if (newGain > bestGain) {
-                bestGain = newGain;
-                best_comm = comm;
-            }
+    // Warp reduction: find max bestGain across lanes (with corresponding best_comm).
+    // Matches the original kernel's "strictly improves bestGain (starts at 0)" rule.
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        double other_gain = __shfl_xor_sync(0xffffffff, bestGain, offset);
+        int    other_comm = __shfl_xor_sync(0xffffffff, best_comm, offset);
+        if (other_gain > bestGain) {
+            bestGain = other_gain;
+            best_comm = other_comm;
         }
     }
 
-    // Write final_comm exactly ONCE, at the very end of the kernel.
-    // Phase 2 (next kernel launch) will read it after cudaDeviceSynchronize.
-    d_p.final_comm[i] = best_comm;
+    if (lane == 0) {
+        d_p.final_comm[i] = best_comm;
+    }
 }
+
+// Note: the warp-cooperative kernel above handles arbitrary num_cands by
+// chunking the candidate array. No thread-per-node fallback is launched.
 
 // Phase 2: Cross-node swap prevention + community size update.
 // Reads d_p.final_comm (fully written by phase1), d_p.older_comm, d_p.size.
@@ -931,40 +934,82 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
     int* d_move_count;
     cudaMalloc((void**)&d_move_count, sizeof(int));
 
+    // PROFILE: cumulative kernel timings via cudaEvent
+    cudaEvent_t ev_start, ev_stop;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+    float ms_prepare = 0, ms_phase1 = 0, ms_phase2 = 0, ms_update = 0, ms_count = 0, ms_quality = 0;
+    int n_iters = 0;
+
     // Main Leiden iteration loop
     do
     {
+        n_iters++;
         moves = 0;
         prev_quality = quality;
 
         // Phase 0: refresh older_comm and clear home_comm (race-free setup)
+        cudaEventRecord(ev_start);
         prepare_iteration_kernel <<< nbl, tpb >>>(
             d_p.older_comm, d_p.node_comm, d_p.home_comm, V);
-        cudaDeviceSynchronize();
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_prepare += t; }
 
-        // Phase 1: pick best community per node (single-pass edge accumulation)
-        find_community_phase1 <<< nbl, tpb >>>(d_p, d_g);
-        cudaDeviceSynchronize();
+        // Phase 1: pick best community per node (warp-cooperative + fallback).
+        // Block size 512 => 16 warps/block; each warp handles one node.
+        {
+            int warps_per_block = tpb / 32;
+            int warp_blocks = (V + warps_per_block - 1) / warps_per_block;
+            size_t shared_bytes = (size_t)warps_per_block *
+                (PHASE1_WARP_MAX_CANDS * sizeof(int) + PHASE1_WARP_MAX_CANDS * sizeof(double));
+
+            cudaEventRecord(ev_start);
+            find_community_phase1_warp <<< warp_blocks, tpb, shared_bytes >>>(d_p, d_g);
+            cudaEventRecord(ev_stop);
+            cudaEventSynchronize(ev_stop);
+            { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_phase1 += t; }
+        }
 
         // Phase 2: cross-node swap check + size update
+        cudaEventRecord(ev_start);
         find_community_phase2 <<< nbl, tpb >>>(d_p, d_g);
-        cudaDeviceSynchronize();
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_phase2 += t; }
 
+        cudaEventRecord(ev_start);
         update_partition <<< nbl, tpb >>>(d_p, d_g);
-        cudaDeviceSynchronize();
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_update += t; }
 
         // Count moves on GPU (only 4 bytes copied back)
+        cudaEventRecord(ev_start);
         cudaMemset(d_move_count, 0, sizeof(int));
         count_moves_kernel<<< nbl, tpb >>>(d_p.node_comm, d_p.older_comm, d_move_count, V);
-        cudaDeviceSynchronize();
         cudaMemcpy(&moves, d_move_count, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_count += t; }
 
         // Compute quality on GPU
+        cudaEventRecord(ev_start);
         quality = find_quality_gpu(d_p, V, d_p.weight, d_p.resolution);
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        { float t; cudaEventElapsedTime(&t, ev_start, ev_stop); ms_quality += t; }
+
         imp = quality - prev_quality;
         printf("new quality: %.6f  imp = %.6f\n", quality, imp);
 
     } while (moves > 0 && imp > 0.005);
+
+    printf("PROFILE V=%d iters=%d  prepare=%.1f phase1=%.1f phase2=%.1f update=%.1f count=%.1f quality=%.1f total=%.1f ms\n",
+           V, n_iters, ms_prepare, ms_phase1, ms_phase2, ms_update, ms_count, ms_quality,
+           ms_prepare + ms_phase1 + ms_phase2 + ms_update + ms_count + ms_quality);
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
 
     cudaFree(d_move_count);
 
