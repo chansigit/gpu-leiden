@@ -11,4 +11,7 @@ def leiden_from_csr(
     resolution: float = ...,
     max_iterations: int = ...,
     random_seed: int = ...,
+    flavor: int = ...,
+    n_restarts: int = ...,
+    temperature: float = ...,
 ) -> NDArray[int32]: ...

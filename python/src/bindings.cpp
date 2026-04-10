@@ -19,7 +19,10 @@ extern "C" int leiden_from_csr(
     double resolution,
     int max_iterations,
     unsigned int random_seed,
-    int* out_labels
+    int* out_labels,
+    int flavor,
+    int n_restarts,
+    double temperature
 );
 
 // Python wrapper accepting numpy arrays for a symmetric (undirected) CSR.
@@ -33,7 +36,10 @@ leiden_from_csr_py(
     int n_nodes,
     double resolution,
     int max_iterations,
-    unsigned int random_seed)
+    unsigned int random_seed,
+    int flavor,
+    int n_restarts,
+    double temperature)
 {
     if (indptr.shape(0) != (size_t)(n_nodes + 1)) {
         throw std::invalid_argument("indptr length must be n_nodes + 1");
@@ -55,7 +61,10 @@ leiden_from_csr_py(
         resolution,
         max_iterations,
         random_seed,
-        labels);
+        labels,
+        flavor,
+        n_restarts,
+        temperature);
 
     if (rc != 0) {
         delete[] labels;
@@ -79,6 +88,11 @@ NB_MODULE(_core, m) {
           nb::arg("resolution") = 1.0,
           nb::arg("max_iterations") = -1,
           nb::arg("random_seed") = 0,
+          nb::arg("flavor") = 0,
+          nb::arg("n_restarts") = 4,
+          nb::arg("temperature") = 0.5,
           "Run GPU Leiden on a symmetric CSR sparse graph.\n"
+          "flavor: 0 = deterministic (bit-reproducible), 1 = quality\n"
+          "  (Gumbel-max sampling + n_restarts iterated local search).\n"
           "Returns an int32 numpy array of length n_nodes with community labels.");
 }

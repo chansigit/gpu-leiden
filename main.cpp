@@ -69,7 +69,11 @@ adj.len=adj.out_gr.size();
 if (mode == "cpu") {
     Leiden_CPU(part, g);
 } else if (mode == "gpu") {
-    Leiden_GPU(part, g, arr_size, NULL, 0);
+    // Phase 3.1: default to deterministic flavor for the legacy CLI test,
+    // which is what tests/verify.sh captures as its GPU baseline.
+    Leiden_GPU(part, g, arr_size, NULL, 0,
+               /*flavor=*/0, /*seed=*/0, /*temperature=*/0.0,
+               /*out_modularity=*/NULL);
 
 } else if (mode == "gpu_csr") {
     // Test the leiden_from_csr C API using the existing graph
@@ -82,7 +86,10 @@ if (mode == "cpu") {
         resolution,
         -1,  // max_iterations
         0,   // random_seed
-        labels
+        labels,
+        /*flavor=*/0,
+        /*n_restarts=*/0,
+        /*temperature=*/0.0
     );
     // Print a summary: number of unique labels (= number of final communities)
     std::set<int> unique_labels(labels, labels + g.nodes);

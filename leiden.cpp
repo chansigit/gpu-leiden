@@ -957,3 +957,244 @@ void refine_partition_cpu(Leiden_Partition& p, graph& g)
     }
 }
 
+// =============================================================================
+// Phase 3.1: PROBABILISTIC refine_partition_cpu variant (Gumbel-max softmax
+//            sampling over positive-gain candidate sub-communities).
+// =============================================================================
+//
+// Structurally identical to refine_partition_cpu above; the only difference
+// is that instead of greedily picking the candidate with the max gain, we
+// SAMPLE a candidate from P(c) ∝ exp(gain[c] / temperature) using the
+// Gumbel-max trick:  sampled_c = argmax_c (gain[c] + temperature * G_c),
+// G_c ~ Gumbel(0, 1) = -log(-log(U)), U ~ Uniform(0, 1].
+//
+// Only candidates with gain > 0 (strictly positive improvement) are
+// considered; the "stay put" option (gain = 0) is always implicitly
+// available and wins if no sampled positive-gain candidate scores higher.
+//
+// Seed mixing: the caller-supplied `seed` is the base; within the OpenMP
+// parallel loop each thread uses `seed + idx * LARGE_PRIME` as its own
+// sub-seed, so output is reproducible regardless of how the OpenMP
+// runtime schedules parent communities to OS threads.
+void refine_partition_cpu_prob(Leiden_Partition& p, graph& g,
+                               unsigned int seed, double temperature)
+{
+    int V = g.nodes;
+    double w = p.weight;
+    double res = p.resolution;
+
+    // 1) save parent partition P
+    std::vector<int> orig_comm(V);
+    for (int i = 0; i < V; i++) orig_comm[i] = p.node_comm[i];
+
+    // 2) reset to singletons
+    for (int i = 0; i < V; i++) p.node_comm[i] = i;
+
+    std::map<int, std::vector<int> > by_orig;
+    for (int i = 0; i < V; i++) {
+        by_orig[orig_comm[i]].push_back(i);
+    }
+
+    std::vector<int> orig_ids;
+    orig_ids.reserve(by_orig.size());
+    for (std::map<int, std::vector<int> >::iterator it = by_orig.begin();
+         it != by_orig.end(); ++it) {
+        orig_ids.push_back(it->first);
+    }
+
+    int n_parents = (int)orig_ids.size();
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int idx = 0; idx < n_parents; idx++) {
+        int c = orig_ids[idx];
+        const std::vector<int>& verts = by_orig[c];
+        if (verts.size() <= 1) continue;
+
+        // Per-parent-community RNG seeded from caller seed + idx so the
+        // sub-seed is a pure function of (caller_seed, community_index),
+        // decoupled from OpenMP thread scheduling.
+        std::mt19937 local_rng(seed ^ ((unsigned int)idx * 2654435761u));
+        std::uniform_real_distribution<double> local_uniform(1e-20, 1.0 - 1e-12);
+
+        // -----------------------------------------------------------------
+        // Precompute parent-community level degree totals (k_S_in, k_S_out)
+        // -----------------------------------------------------------------
+        double k_S_in = 0.0, k_S_out = 0.0;
+        for (size_t k = 0; k < verts.size(); k++) {
+            int v = verts[k];
+            k_S_in  += p.in_deg[v];
+            k_S_out += p.out_deg[v];
+        }
+
+        // -----------------------------------------------------------------
+        // Per-node edge weight from v to the rest of the parent community S
+        // -----------------------------------------------------------------
+        std::vector<double> E_v_S(verts.size(), 0.0);
+        for (size_t k = 0; k < verts.size(); k++) {
+            int v = verts[k];
+            double e = 0.0;
+            for (int ei = g.out_col[v]; ei < g.out_col[v + 1]; ei++) {
+                int u = g.child_out[ei];
+                if (u == v) continue;
+                if (orig_comm[u] == c) e += g.wts_out[ei];
+            }
+            for (int ei = g.in_col[v]; ei < g.in_col[v + 1]; ei++) {
+                int u = g.child_in[ei];
+                if (u == v) continue;
+                if (orig_comm[u] == c) e += g.wts_in[ei];
+            }
+            E_v_S[k] = e;
+        }
+
+        // Well-connectedness of nodes (set R)
+        std::vector<char> in_R(verts.size(), 0);
+        for (size_t k = 0; k < verts.size(); k++) {
+            int v = verts[k];
+            double dv_in  = p.in_deg[v];
+            double dv_out = p.out_deg[v];
+            double expected = res * (dv_in  * (k_S_out - dv_out)
+                                   + dv_out * (k_S_in  - dv_in )) / w;
+            in_R[k] = (E_v_S[k] >= expected) ? 1 : 0;
+        }
+
+        std::map<int, double> sub_tot_in;
+        std::map<int, double> sub_tot_out;
+        std::map<int, double> sub_sum_in;
+        std::map<int, int>    sub_size;
+        std::map<int, double> sub_E_in_S;
+
+        for (size_t k = 0; k < verts.size(); k++) {
+            int v = verts[k];
+            sub_tot_in[v]   = p.in_deg[v];
+            sub_tot_out[v]  = p.out_deg[v];
+            sub_sum_in[v]   = p.self_loops[v];
+            sub_size[v]     = 1;
+            sub_E_in_S[v]   = E_v_S[k];
+        }
+
+        double inv_w  = 1.0 / w;
+        double inv_w2 = inv_w * inv_w;
+
+        for (size_t k = 0; k < verts.size(); k++) {
+            if (!in_R[k]) continue;
+
+            int v = verts[k];
+            int my_sub = p.node_comm[v];
+            if (sub_size[my_sub] != 1) continue;
+
+            std::map<int, double> dnc;
+            for (int e = g.out_col[v]; e < g.out_col[v + 1]; e++) {
+                int u = g.child_out[e];
+                if (u == v) continue;
+                if (orig_comm[u] != c) continue;
+                dnc[p.node_comm[u]] += g.wts_out[e];
+            }
+            for (int e = g.in_col[v]; e < g.in_col[v + 1]; e++) {
+                int u = g.child_in[e];
+                if (u == v) continue;
+                if (orig_comm[u] != c) continue;
+                dnc[p.node_comm[u]] += g.wts_in[e];
+            }
+
+            double dv_in  = p.in_deg[v];
+            double dv_out = p.out_deg[v];
+            double sl_v   = p.self_loops[v];
+
+            double dnc_self = 0.0;
+            std::map<int, double>::iterator it_self = dnc.find(my_sub);
+            if (it_self != dnc.end()) dnc_self = it_self->second;
+
+            sub_tot_in[my_sub]  -= dv_in;
+            sub_tot_out[my_sub] -= dv_out;
+            sub_sum_in[my_sub]  -= dnc_self + sl_v;
+
+            // Sample via Gumbel-max over positive-gain candidates:
+            //   score(c) = gain(c) + (temperature / V) * G_c
+            // "Stay put" (gain=0) is represented by initial score 0;
+            // any sampled candidate with positive perturbed score wins.
+            int    best_sub   = my_sub;
+            double best_score = 0.0;
+            double best_gain  = 0.0;
+
+            for (std::map<int, double>::iterator it = dnc.begin();
+                 it != dnc.end(); ++it) {
+                int sub = it->first;
+                double dncomm = it->second;
+                double t_in  = sub_tot_in[sub];
+                double t_out = sub_tot_out[sub];
+
+                // Well-connectedness of candidate sub (set T)
+                double sub_E = sub_E_in_S[sub];
+                double sub_expected = res * (t_in  * (k_S_out - t_out)
+                                           + t_out * (k_S_in  - t_in )) / w;
+                if (sub_E < sub_expected) continue;
+
+                double gain = (dncomm + sl_v) * inv_w
+                            - res * (t_in * dv_out + t_out * dv_in) * inv_w2;
+
+                if (gain > 0.0) {
+                    double u = local_uniform(local_rng);
+                    double gumbel = -std::log(-std::log(u));
+                    // Scale noise by inv_w = 1/total_weight to match
+                    // the Leiden gain unit (O(1/weight)) automatically.
+                    double noise_scale = temperature * inv_w;
+                    double score = gain + noise_scale * gumbel;
+                    if (score > best_score) {
+                        best_score = score;
+                        best_gain  = gain;
+                        best_sub   = sub;
+                    }
+                }
+            }
+            (void)best_gain;  // kept for potential debug / logging
+
+            double best_dnc = 0.0;
+            std::map<int, double>::iterator it_best = dnc.find(best_sub);
+            if (it_best != dnc.end()) best_dnc = it_best->second;
+
+            sub_tot_in[best_sub]  += dv_in;
+            sub_tot_out[best_sub] += dv_out;
+            sub_sum_in[best_sub]  += best_dnc + sl_v;
+
+            if (best_sub == my_sub) {
+                // No real move
+            } else {
+                sub_size[my_sub]   = 0;
+                sub_size[best_sub] += 1;
+                sub_E_in_S[best_sub] += E_v_S[k] - 2.0 * best_dnc;
+                sub_E_in_S[my_sub] = 0.0;
+                p.node_comm[v] = best_sub;
+            }
+        }
+    }
+
+    // 4) Recompute global tot_in / tot_out / sum_in for the refined partition.
+    for (int i = 0; i < V; i++) {
+        p.tot_in[i]  = 0.0;
+        p.tot_out[i] = 0.0;
+        p.sum_in[i]  = 0.0;
+    }
+    for (int v = 0; v < V; v++) {
+        int c = p.node_comm[v];
+        p.tot_in[c]  += p.in_deg[v];
+        p.tot_out[c] += p.out_deg[v];
+    }
+    for (int v = 0; v < V; v++) {
+        int cv = p.node_comm[v];
+        p.sum_in[cv] += p.self_loops[v];
+        for (int e = g.out_col[v]; e < g.out_col[v + 1]; e++) {
+            int u = g.child_out[e];
+            if (u == v) continue;
+            if (p.node_comm[u] == cv) {
+                p.sum_in[cv] += g.wts_out[e];
+            }
+        }
+        for (int e = g.in_col[v]; e < g.in_col[v + 1]; e++) {
+            int u = g.child_in[e];
+            if (u == v) continue;
+            if (p.node_comm[u] == cv) {
+                p.sum_in[cv] += g.wts_in[e];
+            }
+        }
+    }
+}
+
