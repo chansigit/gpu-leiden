@@ -1,5 +1,7 @@
 #include "struct.h"
-#include <thread> 
+#include <thread>
+#include <set>
+#include <algorithm>
 #include "leiden.h"
 
 
@@ -67,8 +69,31 @@ adj.len=adj.out_gr.size();
 if (mode == "cpu") {
     Leiden_CPU(part, g);
 } else if (mode == "gpu") {
-    Leiden_GPU(part, g, arr_size);
+    Leiden_GPU(part, g, arr_size, NULL, 0);
 
+} else if (mode == "gpu_csr") {
+    // Test the leiden_from_csr C API using the existing graph
+    // (exercises the new API end-to-end with known test data)
+    int* labels = new int[g.nodes];
+    leiden_from_csr(
+        g.out_col, g.child_out, g.wts_out, g.ed,
+        g.in_col,  g.child_in,  g.wts_in,  g.ed,
+        g.nodes,
+        resolution,
+        -1,  // max_iterations
+        0,   // random_seed
+        labels
+    );
+    // Print a summary: number of unique labels (= number of final communities)
+    std::set<int> unique_labels(labels, labels + g.nodes);
+    std::cout << "gpu_csr mode: found " << unique_labels.size() << " communities" << std::endl;
+    // Print first 10 labels for sanity check
+    std::cout << "First 10 labels: ";
+    for (int i = 0; i < std::min(g.nodes, 10); i++) {
+        std::cout << labels[i] << " ";
+    }
+    std::cout << std::endl;
+    delete[] labels;
 } else {
     cout << "Invalid mode. Use 'cpu' or 'gpu'." << endl;
     return 1;

@@ -3,6 +3,7 @@
 #include "leiden.h"
 #include <iostream>
 #include <stdio.h>
+#include <cstring>
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/execution_policy.h>
@@ -290,9 +291,10 @@ __global__ void count_moves_kernel(const int* node_comm, const int* older_comm, 
     }
 }
 
-int renumber_communities(Leiden_Partition& p, graph& g)
+int renumber_communities(Leiden_Partition& p, graph& g,
+                         int* tracked_labels, int n_original)
 {
-    unordered_map<int, vector<int>> comms;            
+    unordered_map<int, vector<int>> comms;
 
     // Group nodes by their community
     for (int comm = 0; comm < g.nodes; comm++)
@@ -312,10 +314,18 @@ int renumber_communities(Leiden_Partition& p, graph& g)
 
     sort(renumber_c.begin(), renumber_c.end());
 
-    unordered_map<int, int> dummy_indexes;                   
+    unordered_map<int, int> dummy_indexes;
     for (int it = 0; it < renumber_c.size(); it++)
     {
         dummy_indexes[renumber_c[it]] = it;
+    }
+
+    // Apply dummy_indexes to tracked_labels: old community IDs -> new super-node IDs
+    // After this, tracked_labels[i] is a valid index into the aggregated graph's node_comm
+    if (tracked_labels != NULL) {
+        for (int i = 0; i < n_original; i++) {
+            tracked_labels[i] = dummy_indexes[tracked_labels[i]];
+        }
     }
 
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -436,9 +446,9 @@ int renumber_communities(Leiden_Partition& p, graph& g)
     cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
     cout << "____________________________________________" << endl;
     
-    Leiden_GPU(p, g, g.ed);
+    Leiden_GPU(p, g, g.ed, tracked_labels, n_original);
 
-    return 0;   
+    return 0;
 }
 
 
@@ -578,9 +588,10 @@ inline double outdegree(graph& g, Leiden_Partition& p, int v)
     return p.out_deg[v];
 }
 
-int Leiden_GPU(Leiden_Partition& p, graph& g, int E)
+int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
+               int* tracked_labels, int n_original)
 {
-    Leiden_Partition d_p; 
+    Leiden_Partition d_p;
     graph d_g;
 
     d_p.weight = p.weight;
@@ -711,14 +722,106 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E)
     cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
     cout << "____________________________________________" << endl;
 
-    if (quality > q_prev_it) 
-    {                        
-        renumber_communities(p, g);
+    if (quality > q_prev_it)
+    {
+        // Compose tracked_labels with p.node_comm BEFORE aggregation
+        // tracked_labels[i] currently = super-node ID at this level for cell i
+        // After composition: tracked_labels[i] = community ID at this level for cell i
+        if (tracked_labels != NULL) {
+            for (int i = 0; i < n_original; i++) {
+                tracked_labels[i] = p.node_comm[tracked_labels[i]];
+            }
+        }
+        renumber_communities(p, g, tracked_labels, n_original);
     }
     else
     {
+        // Final level reached: compose once to get final labels
+        // After this, tracked_labels[i] = final community ID for cell i
+        if (tracked_labels != NULL) {
+            for (int i = 0; i < n_original; i++) {
+                tracked_labels[i] = p.node_comm[tracked_labels[i]];
+            }
+        }
         cout << "Leiden_GPU done and dusted :)" << endl;
     }
 
     return 0;
 }
+
+// ============================================================
+// C API entry point for Python/external callers
+// Accepts CSR arrays directly - no file I/O needed
+// ============================================================
+
+extern "C" {
+
+int leiden_from_csr(
+    // Out-edges CSR (for undirected/symmetric input, same as in-edges CSR)
+    const int*    out_indptr,   // [n_nodes + 1]
+    const int*    out_indices,  // [n_out_edges]
+    const double* out_data,     // [n_out_edges]
+    int n_out_edges,
+    // In-edges CSR
+    const int*    in_indptr,    // [n_nodes + 1]
+    const int*    in_indices,   // [n_in_edges]
+    const double* in_data,      // [n_in_edges]
+    int n_in_edges,
+    // Graph size
+    int n_nodes,
+    // Algorithm parameters
+    double resolution,
+    int max_iterations,         // -1 = unlimited (currently ignored, always runs to convergence)
+    unsigned int random_seed,   // currently ignored
+    // Output (caller-allocated)
+    int* out_labels             // [n_nodes] - filled with community ID per node
+)
+{
+    // Build host-side graph struct (CSR format)
+    // NOTE: graph uses int / double which matches scipy's default int32 / float64
+    graph g;
+    g.nodes = n_nodes;
+    g.ed = n_out_edges;   // legacy field used by create_c_partition for nbrs/pos allocation
+
+    g.out_col = new int[n_nodes + 1];
+    g.in_col  = new int[n_nodes + 1];
+    g.child_out = new int[n_out_edges];
+    g.child_in  = new int[n_in_edges];
+    g.wts_out = new double[n_out_edges];
+    g.wts_in  = new double[n_in_edges];
+
+    std::memcpy(g.out_col,   out_indptr,  (n_nodes + 1) * sizeof(int));
+    std::memcpy(g.in_col,    in_indptr,   (n_nodes + 1) * sizeof(int));
+    std::memcpy(g.child_out, out_indices, n_out_edges * sizeof(int));
+    std::memcpy(g.child_in,  in_indices,  n_in_edges  * sizeof(int));
+    std::memcpy(g.wts_out,   out_data,    n_out_edges * sizeof(double));
+    std::memcpy(g.wts_in,    in_data,     n_in_edges  * sizeof(double));
+
+    // Build partition (reuses existing CPU-side initialization)
+    Leiden_Partition p;
+    p.resolution = resolution;
+    create_c_partition(g, p);
+
+    // Allocate label tracker and initialize to identity (each cell is its own super-node initially)
+    int* tracked_labels = new int[n_nodes];
+    for (int i = 0; i < n_nodes; i++) {
+        tracked_labels[i] = i;
+    }
+
+    // Run Leiden with label tracking
+    // Note: Leiden_GPU may modify g (aggregation overwrites it), but tracked_labels is maintained
+    // across recursion levels so at return, tracked_labels[i] = final community for original cell i.
+    Leiden_GPU(p, g, n_out_edges, tracked_labels, n_nodes);
+
+    // Copy final labels to caller's buffer
+    std::memcpy(out_labels, tracked_labels, n_nodes * sizeof(int));
+
+    // Cleanup
+    delete[] tracked_labels;
+    free(g);         // project-local free(graph&) from leiden.cpp
+    free_part(p);    // from leiden.cpp
+
+    return 0;
+}
+
+}  // extern "C"

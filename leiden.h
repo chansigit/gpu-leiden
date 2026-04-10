@@ -37,10 +37,31 @@ struct gpu_partition {
 
 
 Leiden_Partition create_partition(graph& g, Leiden_Partition& p);
-int Leiden_GPU(Leiden_Partition& p, graph& g, int E);
+int Leiden_GPU(Leiden_Partition& p, graph& g, int E,
+               int* tracked_labels, int n_original);
 double find_quality_cpu(Leiden_Partition& p, graph& g);
 double ToOwnCommunity(int node, int community, double bestGain, int old_comm, Leiden_Partition& d_p, graph& d_g);
 double computGain(int node, int community, Leiden_Partition& d_p, graph& d_g);
 double find_to_own(Leiden_Partition& d_p, graph& d_g, double dncomm, int i, int community, int comm);
+
+extern "C" {
+
+int leiden_from_csr(
+    const int*    out_indptr,
+    const int*    out_indices,
+    const double* out_data,
+    int n_out_edges,
+    const int*    in_indptr,
+    const int*    in_indices,
+    const double* in_data,
+    int n_in_edges,
+    int n_nodes,
+    double resolution,
+    int max_iterations,
+    unsigned int random_seed,
+    int* out_labels
+);
+
+}  // extern "C"
 
 #endif // LEIDEN_H
