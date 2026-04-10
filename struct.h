@@ -40,6 +40,7 @@ struct Leiden_Partition {
   double* sum_kin;
   double* self_loops;
   double weight;
+  double resolution;
   int imp[1];
 
   std::vector <int> neigh_commNb;
@@ -107,7 +108,7 @@ inline double outdegree(graph& g, Leiden_Partition& p, int v);
 
 inline double indegree(graph& g, Leiden_Partition& p, int v);
 
-double cal_quality(double in[], double tot_in[], double tot_out[],long int size, double edgs);
+double cal_quality(double in[], double tot_in[], double tot_out[],long int size, double edgs, double resolution);
 
 void free(graph& g);
 

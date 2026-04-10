@@ -200,7 +200,7 @@ __global__ void find_community(Leiden_Partition d_p, graph d_g)
             }
 
             newGain = (dncomm + d_p.self_loops[i]) / d_p.weight
-                      - ((toc_in * d_p.out_deg[i] + toc_out * d_p.in_deg[i]) / (d_p.weight * d_p.weight));
+                      - d_p.resolution * ((toc_in * d_p.out_deg[i] + toc_out * d_p.in_deg[i]) / (d_p.weight * d_p.weight));
 
             if (newGain > bestGain)                         
             { 
@@ -243,7 +243,7 @@ double find_quality(Leiden_Partition& p, graph& g)
     {
         if (p.tot_in[i] > 0 || p.tot_out[i] > 0) 
         {
-            q += p.sum_in[i] - (p.tot_in[i] * p.tot_out[i] / p.weight);
+            q += p.sum_in[i] - p.resolution * (p.tot_in[i] * p.tot_out[i] / p.weight);
         }
     }
 
@@ -545,6 +545,7 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E)
     graph d_g;
 
     d_p.weight = p.weight;
+    d_p.resolution = p.resolution;
     d_g.nodes = g.nodes;
     int V = g.nodes;
 

@@ -21,7 +21,7 @@ int Leiden_CPU(Leiden_Partition& p, graph& gr)
     double q_prev_it = 0;
     double edg_wt = p.weight;
 
-    quality = cal_quality(p.sum_in, p.tot_in, p.tot_out, gr.nodes, p.weight);
+    quality = cal_quality(p.sum_in, p.tot_in, p.tot_out, gr.nodes, p.weight, p.resolution);
     cout << "old quality: " << quality << endl;
     q_prev_it = quality;
 
@@ -89,7 +89,7 @@ int Leiden_CPU(Leiden_Partition& p, graph& gr)
                 }
 
                 newGain = (dncomm + p.self_loops[i]) / p.weight -
-                          ((p.tot_in[comm] * p.out_deg[i] + p.tot_out[comm] * p.in_deg[i]) /
+                          p.resolution * ((p.tot_in[comm] * p.out_deg[i] + p.tot_out[comm] * p.in_deg[i]) /
                            (p.weight * p.weight));
 
                 if (newGain > bestGain)
@@ -112,7 +112,7 @@ int Leiden_CPU(Leiden_Partition& p, graph& gr)
             }
         }
 
-        quality = cal_quality(p.sum_in, p.tot_in, p.tot_out, gr.nodes, p.weight);
+        quality = cal_quality(p.sum_in, p.tot_in, p.tot_out, gr.nodes, p.weight, p.resolution);
         imp = quality - prev_quality;
         cout << "new quality: " << quality << "  imp  = " << imp << endl;
 
@@ -137,18 +137,18 @@ else
 }
 
 
-double cal_quality(double in[], double tot_in[], double tot_out[],long int size, double edgs)
+double cal_quality(double in[], double tot_in[], double tot_out[],long int size, double edgs, double resolution)
 {
    double q=0;
    for(long int i=0; i< size; i++)
    {
-      if (tot_in[i] > 0 || tot_out[i] > 0) 
-      { 
-        q+=in[i]-(tot_in[i]*tot_out[i]/(edgs));             
+      if (tot_in[i] > 0 || tot_out[i] > 0)
+      {
+        q+=in[i]-resolution*(tot_in[i]*tot_out[i]/(edgs));
       }
    }
-          q= q/(edgs);   
-       
+          q= q/(edgs);
+
      return q;
 }
 

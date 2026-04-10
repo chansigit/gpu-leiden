@@ -10,12 +10,17 @@ int main(int argc, char* argv[])
 {
 
   if (argc < 3) {
-        cout << "Usage: " << argv[0] << " <input_file>" << endl;
+        cout << "Usage: " << argv[0] << " <input_file> <cpu|gpu> [resolution]" << endl;
         return 1;
     }
 
 string filename = argv[1];
 string mode = argv[2];
+double resolution = 1.0;
+if (argc >= 4) {
+    resolution = atof(argv[3]);
+}
+cout << "Resolution: " << resolution << endl;
 std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
 ifstream file(filename);
 auto start_time = std::chrono::high_resolution_clock::now();
@@ -51,6 +56,7 @@ adj.len=adj.out_gr.size();
  std::cout << "Time taken for reading first graph is " << duration.count() << " minutes!" << std::endl;
 
  Leiden_Partition part;
+ part.resolution = resolution;
  graph g;
  g.nodes= adj.len;
  graph_process(adj, g);
