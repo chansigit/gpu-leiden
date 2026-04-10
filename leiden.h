@@ -38,7 +38,7 @@ struct gpu_partition {
 
 Leiden_Partition create_partition(graph& g, Leiden_Partition& p);
 int Leiden_GPU(Leiden_Partition& p, graph& g, int E);
-double find_quality(Leiden_Partition& p, graph& g);
+double find_quality_cpu(Leiden_Partition& p, graph& g);
 double ToOwnCommunity(int node, int community, double bestGain, int old_comm, Leiden_Partition& d_p, graph& d_g);
 double computGain(int node, int community, Leiden_Partition& d_p, graph& d_g);
 double find_to_own(Leiden_Partition& d_p, graph& d_g, double dncomm, int i, int community, int comm);

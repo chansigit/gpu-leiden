@@ -235,13 +235,13 @@ __global__ void find_community(Leiden_Partition d_p, graph d_g)
 }
 
  
-double find_quality(Leiden_Partition& p, graph& g)
+double find_quality_cpu(Leiden_Partition& p, graph& g)
 {
     double q = 0.0;
 
     for (int i = 0; i < g.nodes; i++)
     {
-        if (p.tot_in[i] > 0 || p.tot_out[i] > 0) 
+        if (p.tot_in[i] > 0 || p.tot_out[i] > 0)
         {
             q += p.sum_in[i] - p.resolution * (p.tot_in[i] * p.tot_out[i] / p.weight);
         }
@@ -249,6 +249,45 @@ double find_quality(Leiden_Partition& p, graph& g)
 
     q = q / p.weight;
     return q;
+}
+
+struct QualityFunctor {
+    const double* sum_in;
+    const double* tot_in;
+    const double* tot_out;
+    double weight;
+    double resolution;
+
+    __host__ __device__
+    QualityFunctor(const double* si, const double* ti, const double* to, double w, double r)
+        : sum_in(si), tot_in(ti), tot_out(to), weight(w), resolution(r) {}
+
+    __host__ __device__
+    double operator()(int i) const {
+        if (tot_in[i] > 0 || tot_out[i] > 0) {
+            return sum_in[i] - resolution * (tot_in[i] * tot_out[i] / weight);
+        }
+        return 0.0;
+    }
+};
+
+double find_quality_gpu(Leiden_Partition& d_p, int V, double weight, double resolution)
+{
+    thrust::counting_iterator<int> begin(0);
+    thrust::counting_iterator<int> end(V);
+    QualityFunctor functor(d_p.sum_in, d_p.tot_in, d_p.tot_out, weight, resolution);
+    double q = thrust::transform_reduce(thrust::device, begin, end, functor, 0.0, thrust::plus<double>());
+    return q / weight;
+}
+
+__global__ void count_moves_kernel(const int* node_comm, const int* older_comm, int* move_count, int V)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < V) {
+        if (node_comm[i] != older_comm[i]) {
+            atomicAdd(move_count, 1);
+        }
+    }
 }
 
 int renumber_communities(Leiden_Partition& p, graph& g)
@@ -601,9 +640,13 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E)
     int moves = 0;
     double prev_quality = 0.0;
     double q_prev_it = 0;
-    quality = find_quality(p, g);
+    quality = find_quality_gpu(d_p, V, p.weight, p.resolution);
     q_prev_it = quality;
     printf("previous quality: %f\n", q_prev_it);
+
+    // Allocate device counter for move counting
+    int* d_move_count;
+    cudaMalloc((void**)&d_move_count, sizeof(int));
 
     // Main Leiden iteration loop
     do
@@ -618,25 +661,27 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E)
         update_partition <<< nbl, tpb >>>(d_p, d_g);
         cudaDeviceSynchronize();
 
-        // Copy data back from GPU
-        cudaMemcpy(p.node_comm, d_p.node_comm, V * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(p.sum_in, d_p.sum_in, V * sizeof(double), cudaMemcpyDeviceToHost);
-        cudaMemcpy(p.tot_in, d_p.tot_in, V * sizeof(double), cudaMemcpyDeviceToHost);
-        cudaMemcpy(p.tot_out, d_p.tot_out, V * sizeof(double), cudaMemcpyDeviceToHost);
-        cudaMemcpy(p.older_comm, d_p.older_comm, V * sizeof(int), cudaMemcpyDeviceToHost);
+        // Count moves on GPU (only 4 bytes copied back)
+        cudaMemset(d_move_count, 0, sizeof(int));
+        count_moves_kernel<<< nbl, tpb >>>(d_p.node_comm, d_p.older_comm, d_move_count, V);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&moves, d_move_count, sizeof(int), cudaMemcpyDeviceToHost);
 
-        for (int comm = 0; comm < g.nodes; comm++)
-        {
-            if (p.node_comm[comm] != p.older_comm[comm])
-            {
-                moves++;
-            }
-        }
-        quality = find_quality(p, g);
+        // Compute quality on GPU
+        quality = find_quality_gpu(d_p, V, d_p.weight, d_p.resolution);
         imp = quality - prev_quality;
         printf("new quality: %.6f  imp = %.6f\n", quality, imp);
 
     } while (moves > 0 && imp > 0.005);
+
+    cudaFree(d_move_count);
+
+    // Copy data back from GPU ONCE after convergence (needed for aggregation phase)
+    cudaMemcpy(p.node_comm, d_p.node_comm, V * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(p.sum_in, d_p.sum_in, V * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(p.tot_in, d_p.tot_in, V * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(p.tot_out, d_p.tot_out, V * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(p.older_comm, d_p.older_comm, V * sizeof(int), cudaMemcpyDeviceToHost);
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::minutes>(end_time - start_time);
