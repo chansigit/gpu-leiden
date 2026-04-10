@@ -522,5 +522,8 @@ void free_part(Leiden_Partition& p)
   delete[] p.older_comm;
   delete[] p.sum_kin;
   delete[] p.self_loops;
+  delete[] p.nbrs;
+  delete[] p.pos;
+  delete[] p.size;
 }
 

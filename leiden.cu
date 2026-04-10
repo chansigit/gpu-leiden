@@ -683,6 +683,27 @@ int Leiden_GPU(Leiden_Partition& p, graph& g, int E)
     cudaMemcpy(p.tot_out, d_p.tot_out, V * sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(p.older_comm, d_p.older_comm, V * sizeof(int), cudaMemcpyDeviceToHost);
 
+    // Free device memory
+    cudaFree(d_p.node_comm);
+    cudaFree(d_p.size);
+    cudaFree(d_p.home_comm);
+    cudaFree(d_p.older_comm);
+    cudaFree(d_p.final_comm);
+    cudaFree(d_p.in_deg);
+    cudaFree(d_p.out_deg);
+    cudaFree(d_p.tot_in);
+    cudaFree(d_p.tot_out);
+    cudaFree(d_p.sum_in);
+    cudaFree(d_p.self_loops);
+    cudaFree(d_g.child_in);
+    cudaFree(d_g.child_out);
+    cudaFree(d_g.wts_in);
+    cudaFree(d_g.wts_out);
+    cudaFree(d_g.in_col);
+    cudaFree(d_g.out_col);
+    cudaFree(d_p.nbrs);
+    cudaFree(d_p.pos);
+
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::minutes>(end_time - start_time);
     cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
