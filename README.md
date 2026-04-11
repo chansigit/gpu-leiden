@@ -152,6 +152,27 @@ Observations:
   ~0.006 on merfish), but ARI agreement is already high and the quality
   flavor is directionally closing the gap.
 
+## Visualization
+
+UMAP comparison on the pcw6 dataset (28,630 cells, `resolution=1.0`, `seed=42`):
+
+![UMAP comparison: leidenalg vs gpu deterministic vs gpu quality](figures/umap_compare.png)
+
+The three methods produce visually similar partitions. Peripheral communities
+(isolated lobes, small satellite groups) are recovered identically by all
+three. The remaining divergence is concentrated in the dense central region
+where community boundaries are genuinely ambiguous.
+
+The heatmap below shows per-cell co-cluster agreement with leidenalg
+(green = same grouping, red = different boundary):
+
+![Co-cluster agreement with leidenalg](figures/umap_agreement.png)
+
+The quality flavor (right, ARI 0.792) is noticeably greener than the
+deterministic flavor (left, ARI 0.726) in boundary regions, confirming
+that the ILS shake-kick restarts recover finer community structure that
+deterministic local moving misses.
+
 ## Building the C++/CUDA core
 
 For developers hacking on the CUDA kernels or the CLI binary
