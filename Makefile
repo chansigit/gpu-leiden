@@ -27,9 +27,9 @@
 
 CC = g++
 NVCC = nvcc -diag-suppress 550,177,20092,549,20011
-CFLAGS = -O3 -g -march=native
+CFLAGS = -O3 -g -march=native -fopenmp
 CUDAFLAGS = -arch=sm_80
-LIBFLAGS = -lm
+LIBFLAGS = -lm -lgomp
 EXEC = leiden
 
 all: $(EXEC)

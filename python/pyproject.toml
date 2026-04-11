@@ -1,0 +1,39 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "nanobind>=2.0",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "gpu-leiden"
+version = "0.1.0"
+description = "GPU-accelerated Leiden community detection"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    {name = "chansigit"}
+]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.6",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.scikit-build]
+wheel.packages = ["gpu_leiden"]
+cmake.build-type = "Release"
+minimum-version = "build-system.requires"
+
+[tool.scikit-build.cmake.define]
+CMAKE_CUDA_ARCHITECTURES = "80"

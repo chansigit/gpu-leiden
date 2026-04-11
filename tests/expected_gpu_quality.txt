@@ -1,0 +1,33 @@
+previous quality: -0.009916
+new quality: 0.071578  imp = 0.081494
+new quality: 0.228571  imp = 0.156993
+new quality: 0.393135  imp = 0.164564
+new quality: 0.518406  imp = 0.125271
+new quality: 0.554417  imp = 0.036012
+new quality: 0.576293  imp = 0.021875
+new quality: 0.579023  imp = 0.002731
+new quality: 0.583091  imp = 0.004068
+new quality: 0.587949  imp = 0.004858
+new quality: 0.593147  imp = 0.005198
+new quality: 0.595325  imp = 0.002178
+new quality: 0.595325  imp = 0.000000
+Leiden step completed in 0 minutes!
+previous quality: 0.162571
+new quality: 0.287845  imp = 0.125274
+new quality: 0.402551  imp = 0.114706
+new quality: 0.460036  imp = 0.057485
+new quality: 0.478462  imp = 0.018426
+new quality: 0.505075  imp = 0.026613
+new quality: 0.513649  imp = 0.008574
+new quality: 0.516801  imp = 0.003152
+new quality: 0.516801  imp = 0.000000
+Leiden step completed in 0 minutes!
+previous quality: 0.251512
+new quality: 0.363497  imp = 0.111986
+new quality: 0.363497  imp = 0.000000
+Leiden step completed in 0 minutes!
+previous quality: 0.263798
+new quality: 0.316464  imp = 0.052666
+new quality: 0.316464  imp = 0.000000
+Leiden step completed in 0 minutes!
+Leiden_GPU done and dusted :)
